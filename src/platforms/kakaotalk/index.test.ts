@@ -10,10 +10,12 @@ import {
   KakaoChatSchema,
   KakaoConfigSchema,
   KakaoLeaveChatResultSchema,
+  KakaoMessagePageSchema,
   KakaoMessageSchema,
   KakaoSendResultSchema,
   KakaoTalkClient,
   KakaoTalkError,
+  isOpenKakaoChatType,
   KakaoTalkListener,
   KakaoTalkPushMemberEventSchema,
   KakaoTalkPushMessageEventSchema,
@@ -47,8 +49,39 @@ it('KakaoChatSchema is exported from barrel', () => {
   expect(typeof KakaoChatSchema.parse).toBe('function')
 })
 
+it('KakaoChatSchema preserves a non-empty string channel type', () => {
+  for (const channelType of ['DirectChat', 'MultiChat', 'PlusChat', 'MemoChat', 'OM', 'OD', 'FutureChat']) {
+    expect(
+      KakaoChatSchema.parse({
+        chat_id: '300',
+        type: channelType,
+        display_name: null,
+        title: null,
+        active_members: 2,
+        unread_count: 0,
+        last_message: null,
+      }).type,
+    ).toBe(channelType)
+  }
+  expect(() =>
+    KakaoChatSchema.parse({
+      chat_id: '300',
+      type: '',
+      display_name: null,
+      title: null,
+      active_members: 2,
+      unread_count: 0,
+      last_message: null,
+    }),
+  ).toThrow()
+})
+
 it('KakaoMessageSchema is exported from barrel', () => {
   expect(typeof KakaoMessageSchema.parse).toBe('function')
+})
+
+it('KakaoMessagePageSchema is exported from barrel', () => {
+  expect(typeof KakaoMessagePageSchema.parse).toBe('function')
 })
 
 it('KakaoSendResultSchema is exported from barrel', () => {
@@ -81,6 +114,12 @@ it('KakaoProfileSchema is exported from barrel', () => {
 
 it('classifyKakaoChat is exported from barrel', () => {
   expect(typeof classifyKakaoChat).toBe('function')
+})
+
+it('isOpenKakaoChatType is exported from barrel', () => {
+  expect(isOpenKakaoChatType('OM')).toBe(true)
+  expect(isOpenKakaoChatType(13)).toBe(true)
+  expect(isOpenKakaoChatType('UNKNOWN')).toBe(false)
 })
 
 it('KakaoLeaveChatResultSchema is exported from barrel', () => {

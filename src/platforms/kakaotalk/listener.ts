@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events'
 
-import type { KakaoSessionEvent, KakaoTalkClient } from './client'
+import { KakaoTalkError, type KakaoSessionEvent, type KakaoTalkClient } from './client'
 import type { LocoPacket } from './protocol/types'
 import {
   KAKAO_EMOTICON_KIND_BY_TYPE,
@@ -67,21 +67,24 @@ export class KakaoTalkListener {
     this.running = true
 
     this.unsubscribePush = this.client.onPush((packet) => this.handlePush(packet))
-    this.unsubscribeSession = this.client.onSessionEvent((event) => this.handleSessionEvent(event))
+    const subscription = this.client.onSessionEvent((event) => this.handleSessionEvent(event))
+    this.unsubscribeSession = subscription
 
     const alreadyConnected = this.client.isConnected()
 
     try {
       await this.client.acquireSession()
-      if (!this.running) return
+      if (!this.running || this.unsubscribeSession !== subscription) return
       if (alreadyConnected) {
         const { userId } = this.client.getCredentials()
         this.emitter.emit('connected', { userId })
       }
     } catch (error) {
-      this.emitter.emit('error', error instanceof Error ? error : new Error(String(error)))
+      // A blocked event or stop may already have ended this exact subscription.
+      if (!this.running || this.unsubscribeSession !== subscription) return
       this.running = false
       this.teardown()
+      this.emitter.emit('error', error instanceof Error ? error : new Error(String(error)))
     }
   }
 
@@ -125,6 +128,11 @@ export class KakaoTalkListener {
         break
       case 'disconnected':
         this.emitter.emit('disconnected')
+        break
+      case 'connection_blocked':
+        this.running = false
+        this.teardown()
+        this.emitter.emit('error', new KakaoTalkError('Connection admission blocked', event.code))
         break
       case 'kicked':
         this.emitter.emit('error', new Error(event.reason))

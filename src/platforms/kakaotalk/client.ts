@@ -34,10 +34,26 @@ import {
   type KakaoTypingResult,
 } from './types'
 
+type ConnectionAdmissionFailureCode = 'connection_admission_denied' | 'connection_admission_failed'
+
+export interface KakaoConnectionAdmissionContext {
+  readonly attemptSequence: number
+  readonly signal: AbortSignal
+}
+
+/** Reserve permission only; never await this client's own acquisition from the callback. */
+export type KakaoConnectionAdmission = (context: KakaoConnectionAdmissionContext) => boolean | Promise<boolean>
+
+export interface KakaoTalkClientOptions {
+  /** Opt-in pre-connect reservation. A sequence is client-local, not a durable/global budget. */
+  readonly connectionAdmission?: KakaoConnectionAdmission
+}
+
 export type KakaoSessionEvent =
   | { type: 'connected'; userId: string }
   | { type: 'disconnected' }
   | { type: 'kicked'; reason: string }
+  | { type: 'connection_blocked'; code: ConnectionAdmissionFailureCode }
 
 export type KakaoPushHandler = (packet: LocoPacket) => void
 export type KakaoSessionEventHandler = (event: KakaoSessionEvent) => void
@@ -817,6 +833,22 @@ export class KakaoTalkClient {
   private sessionEventHandlers = new Set<KakaoSessionEventHandler>()
   private nameCache = new MemberNameCache()
 
+  private readonly connectionAdmission: KakaoConnectionAdmission | undefined
+  private admissionSequence = 0
+  private admissionController: AbortController | null = null
+  private admissionFailure: ConnectionAdmissionFailureCode | null = null
+
+  constructor(options: KakaoTalkClientOptions = {}) {
+    try {
+      if (!options || typeof options !== 'object' || Array.isArray(options)) throw new Error()
+      const admission = options.connectionAdmission
+      if (admission !== undefined && typeof admission !== 'function') throw new Error()
+      this.connectionAdmission = admission
+    } catch {
+      throw new KakaoTalkError('Invalid connection admission options', 'connection_admission_failed')
+    }
+  }
+
   async login(
     credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: KakaoDeviceType },
     accountId?: string,
@@ -859,12 +891,16 @@ export class KakaoTalkClient {
   private async ensureSession(): Promise<SessionState> {
     this.ensureAuth()
     if (this.closed) throw new KakaoTalkError('Client is closed', 'client_closed')
+    if (this.admissionFailure) throw new KakaoTalkError('Connection admission blocked', this.admissionFailure)
     if (this.state) return this.state
 
     // Guard against concurrent init — reuse the in-flight promise
     const isOwner = !this.initPromise
     if (!this.initPromise) {
-      this.initPromise = this.connect()
+      // Publish the owner before user admission code can reenter acquisition.
+      this.initPromise = this.connectionAdmission
+        ? Promise.resolve().then(() => this.connectWithAdmission())
+        : this.connect()
     }
 
     try {
@@ -933,7 +969,59 @@ export class KakaoTalkClient {
     }
   }
 
-  private async connect(): Promise<SessionState> {
+  private blockConnectionAdmission(code: ConnectionAdmissionFailureCode): KakaoTalkError {
+    if (this.admissionFailure === null) {
+      this.admissionFailure = code
+      this.emitSessionEvent({ type: 'connection_blocked', code })
+    }
+    return new KakaoTalkError('Connection admission blocked', this.admissionFailure)
+  }
+
+  private async connectWithAdmission(): Promise<SessionState> {
+    if (this.closed) throw new KakaoTalkError('Client is closed', 'client_closed')
+    const credentials = this.getCredentials()
+    const controller = new AbortController()
+    this.admissionController = controller
+    const { signal } = controller
+    const context: KakaoConnectionAdmissionContext = Object.freeze({
+      attemptSequence: ++this.admissionSequence,
+      signal,
+    })
+    let onAbort!: () => void
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new KakaoTalkError('Client is closed', 'client_closed'))
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      let admitted: boolean
+      try {
+        // Race observes late rejection too, even when the callback ignores abort.
+        admitted = await Promise.race([
+          Promise.resolve().then(() => {
+            if (signal.aborted) throw new KakaoTalkError('Client is closed', 'client_closed')
+            return this.connectionAdmission!(context)
+          }),
+          cancelled,
+        ])
+      } catch {
+        if (this.closed || signal.aborted) throw new KakaoTalkError('Client is closed', 'client_closed')
+        throw this.blockConnectionAdmission('connection_admission_failed')
+      }
+      if (this.closed || signal.aborted) throw new KakaoTalkError('Client is closed', 'client_closed')
+      if (credentials.oauthToken !== this.oauthToken || credentials.userId !== this.userId ||
+          credentials.deviceUuid !== this.deviceUuid || credentials.deviceType !== this.deviceType) {
+        throw this.blockConnectionAdmission('connection_admission_failed')
+      }
+      if (admitted !== true) throw this.blockConnectionAdmission('connection_admission_denied')
+      // No await before connect takes ownership; use the admitted tuple for its I/O.
+      return this.connect(credentials)
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+      if (this.admissionController === controller) this.admissionController = null
+    }
+  }
+
+  private async connect(credentials?: ReturnType<KakaoTalkClient['getCredentials']>): Promise<SessionState> {
     const session = new LocoSession()
     session.onPush((packet) => this.dispatchPush(session, packet))
     session.onClose(() => {
@@ -945,17 +1033,17 @@ export class KakaoTalkClient {
     })
 
     try {
-      const syncState = await loadSyncState(this.deviceUuid!)
+      const syncState = await loadSyncState(credentials?.deviceUuid ?? this.deviceUuid!)
       const loginResult = await session.login(
-        this.oauthToken!,
-        this.userId!,
-        this.deviceUuid!,
+        credentials?.oauthToken ?? this.oauthToken!,
+        credentials?.userId ?? this.userId!,
+        credentials?.deviceUuid ?? this.deviceUuid!,
         syncState,
-        this.deviceType,
+        credentials?.deviceType ?? this.deviceType,
       )
 
       const newSyncState = mergeSyncState(syncState, loginResult)
-      await saveSyncState(this.deviceUuid!, newSyncState)
+      await saveSyncState(credentials?.deviceUuid ?? this.deviceUuid!, newSyncState)
 
       this.nameCache.ingest((loginResult.chatDatas ?? []) as ChatData[])
 
@@ -1898,6 +1986,7 @@ export class KakaoTalkClient {
 
   close(): void {
     this.closed = true
+    this.admissionController?.abort()
     if (this.state) {
       this.state.session.close()
     } else if (this.initPromise) {

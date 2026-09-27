@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, it } from 'bun:test'
 
+import { Long } from 'bson'
+
 import { KakaoTalkClient, KakaoTalkError } from './client'
 
 // Mock LocoSession at module level
@@ -503,6 +505,82 @@ describe('KakaoTalkClient', () => {
 
       client.close()
     })
+
+    it('resolves an open-chat title when the link id arrives as a promoted number', async () => {
+      // The packet decoder promotes an int64 that fits in 53 bits to a
+      // number, which is how real open-link ids reach the chat list.
+      mockLogin.mockResolvedValue({
+        chatDatas: [
+          {
+            c: 600,
+            t: 'OM',
+            li: 8888,
+            k: ['User2'],
+            i: [20],
+            a: 1,
+            n: 0,
+            o: 1700000001,
+            l: null,
+            ll: makeLong(3),
+          },
+        ],
+        lastTokenId: makeLong(0),
+        lastChatId: makeLong(0),
+        eof: true,
+      })
+      mockGetChannelInfo.mockResolvedValue({ body: { chatInfo: { chatMetas: [] } } })
+      mockGetOpenLinkInfo.mockResolvedValueOnce({ body: { ols: [{ ln: 'Promoted Link Name' }] } })
+
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
+      const chats = await client.getChats({ resolveTitles: true })
+
+      expect(chats).toHaveLength(1)
+      expect(chats[0].title).toBe('Promoted Link Name')
+      expect(mockGetOpenLinkInfo).toHaveBeenCalledTimes(1)
+      const [linkIds] = mockGetOpenLinkInfo.mock.calls[0] as [Array<{ low: number; high: number }>]
+      expect(linkIds).toHaveLength(1)
+      expect(linkIds[0]).toBeInstanceOf(Long)
+      expect(linkIds[0]).toMatchObject({ low: 8888, high: 0 })
+
+      client.close()
+    })
+
+    for (const invalidLinkId of [0, -5, 1.5, Number.MAX_SAFE_INTEGER + 2]) {
+      it(`does not contact INFOLINK for an unusable numeric link id ${invalidLinkId}`, async () => {
+        mockLogin.mockResolvedValue({
+          chatDatas: [
+            {
+              c: 600,
+              t: 'OM',
+              li: invalidLinkId,
+              k: ['User2'],
+              i: [20],
+              a: 1,
+              n: 0,
+              o: 1700000001,
+              l: null,
+              ll: makeLong(3),
+            },
+          ],
+          lastTokenId: makeLong(0),
+          lastChatId: makeLong(0),
+          eof: true,
+        })
+        mockGetChannelInfo.mockResolvedValue({ body: { chatInfo: { chatMetas: [] } } })
+
+        const client = await new KakaoTalkClient().login({
+          oauthToken: 'token',
+          userId: 'user1',
+          deviceUuid: 'device1',
+        })
+        const chats = await client.getChats({ resolveTitles: true })
+
+        expect(chats[0].title).toBeNull()
+        expect(mockGetOpenLinkInfo).not.toHaveBeenCalled()
+
+        client.close()
+      })
+    }
 
     it('sorts chats by recency (o field descending)', async () => {
       const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
@@ -1491,6 +1569,44 @@ describe('KakaoTalkClient', () => {
       expect(chat.type).toBe(13)
       expect(chat.title).toBe('Numeric Open Title')
       expect(mockGetOpenLinkInfo).toHaveBeenCalledTimes(1)
+
+      client.close()
+    })
+
+    it('falls back to INFOLINK when CHATINFO carries the link id as a promoted number', async () => {
+      mockGetChannelInfo.mockResolvedValueOnce({
+        statusCode: 0,
+        body: {
+          chatInfo: {
+            chatId: makeLong(300),
+            type: 'OM',
+            activeMembersCount: 2,
+            newMessageCount: 0,
+            invalidNewMessageCount: false,
+            lastLogId: makeLong(77),
+            lastSeenLogId: makeLong(73),
+            lastChatLog: null,
+            displayMembers: [],
+            chatMetas: [],
+            li: 7777,
+            pushAlert: true,
+          },
+        },
+      })
+      mockGetOpenLinkInfo.mockResolvedValueOnce({ body: { ols: [{ ln: 'Exact Promoted Title' }] } })
+
+      const client = await new KakaoTalkClient().login({
+        oauthToken: 'token',
+        userId: 'user1',
+        deviceUuid: 'device1',
+      })
+      const chat = await client.getChat('300')
+
+      expect(chat.title).toBe('Exact Promoted Title')
+      expect(mockGetOpenLinkInfo).toHaveBeenCalledTimes(1)
+      const [linkIds] = mockGetOpenLinkInfo.mock.calls[0] as [Array<{ low: number; high: number }>]
+      expect(linkIds[0]).toBeInstanceOf(Long)
+      expect(linkIds[0]).toMatchObject({ low: 7777, high: 0 })
 
       client.close()
     })

@@ -376,7 +376,14 @@ function isOpenChat(chat: ChatData): boolean {
 }
 
 function getOpenLinkId(chat: ChatData): Long | null {
-  return bsonToLong(chat.li) ?? null
+  // BSON decoding promotes an int64 that fits in 53 bits to a number, and a
+  // real open-link id does, so the wire value usually arrives as a plain
+  // positive integer rather than a Long.
+  const linkId: unknown = chat.li
+  if (typeof linkId === 'number') {
+    return Number.isSafeInteger(linkId) && linkId > 0 ? Long.fromNumber(linkId) : null
+  }
+  return bsonToLong(linkId) ?? null
 }
 
 function getLoginMaxLogId(loginResult: LoginListResponse, chatId: string): Long | null {

@@ -1553,7 +1553,10 @@ export class KakaoTalkClient {
       assertLocoOk(entry, 'CHATONROOM')
       if (longToString(entry.body.c) !== normalizedChatId) throw new Error('member_entry_chat_mismatch')
       let members: ReturnType<typeof exactMemberRecords>
-      if (first.activeMembers <= 100) {
+      // CHATONROOM can return full records even above 100 active members.
+      // Accept that unambiguous wire shape; the exact identities and the
+      // second CHATINFO count/consistency checks still apply below.
+      if (first.activeMembers <= 100 || (entry.body.mi === undefined && Array.isArray(entry.body.m))) {
         if (entry.body.mi !== undefined) throw new Error('member_entry_shape_invalid')
         members = exactMemberRecords(entry.body.m, 'CHATONROOM')
       } else {

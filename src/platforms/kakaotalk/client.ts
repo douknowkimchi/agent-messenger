@@ -66,12 +66,24 @@ export type KakaoTalkGetChatFailureReason =
   | 'chat_info_absent'
   | 'transport_or_unknown'
 
+/** Counts and comparisons only; never member identities, names or packet bodies. */
+export interface KakaoTalkMemberSnapshotFailure {
+  firstActiveCount: number
+  firstMemberCount: number
+  secondActiveCount: number
+  secondMemberCount: number
+  displayIdsStable: boolean
+  memberIdsStable: boolean
+  displayMembersContained: boolean
+}
+
 export class KakaoTalkError extends Error {
   code: string
   readonly serverStatus?: number
   readonly responseFailureKind?: KakaoTalkResponseFailureKind
   readonly responseStatusSource?: KakaoTalkResponseStatusSource
   readonly getChatFailureReason?: KakaoTalkGetChatFailureReason
+  readonly memberSnapshotFailure?: Readonly<KakaoTalkMemberSnapshotFailure>
 
   constructor(
     message: string,
@@ -82,6 +94,7 @@ export class KakaoTalkError extends Error {
       responseFailureKind?: KakaoTalkResponseFailureKind
       responseStatusSource?: KakaoTalkResponseStatusSource
       getChatFailureReason?: KakaoTalkGetChatFailureReason
+      memberSnapshotFailure?: Readonly<KakaoTalkMemberSnapshotFailure>
     },
   ) {
     super(message, options)
@@ -91,6 +104,7 @@ export class KakaoTalkError extends Error {
     this.responseFailureKind = options?.responseFailureKind
     this.responseStatusSource = options?.responseStatusSource
     this.getChatFailureReason = options?.getChatFailureReason
+    this.memberSnapshotFailure = options?.memberSnapshotFailure
   }
 }
 
@@ -437,6 +451,7 @@ function wrapError(
       responseFailureKind,
       responseStatusSource: error.responseStatusSource,
       getChatFailureReason,
+      memberSnapshotFailure: error.memberSnapshotFailure,
     })
   }
   const message = error instanceof Error ? error.message : String(error)
@@ -1470,7 +1485,17 @@ export class KakaoTalkClient {
           !sameIds(firstMembers.ids, secondMembers.ids) ||
           !subsetIds(secondChat.ids, secondMembers.ids)
         ) {
-          throw new Error('member_snapshot_changed_or_incomplete')
+          throw new KakaoTalkError('member_snapshot_changed_or_incomplete', 'get_member_snapshot_failed', {
+            memberSnapshotFailure: Object.freeze({
+              firstActiveCount: firstChat.activeMembers,
+              firstMemberCount: firstMembers.records.length,
+              secondActiveCount: secondChat.activeMembers,
+              secondMemberCount: secondMembers.records.length,
+              displayIdsStable: sameIds(firstChat.ids, secondChat.ids),
+              memberIdsStable: sameIds(firstMembers.ids, secondMembers.ids),
+              displayMembersContained: subsetIds(secondChat.ids, secondMembers.ids),
+            }),
+          })
         }
         return {
           chat_id: normalizedChatId,
@@ -1493,6 +1518,7 @@ export class KakaoTalkClient {
         throw new KakaoTalkError(error.message, 'get_members_failed', {
           cause: error,
           serverStatus: error.serverStatus,
+          memberSnapshotFailure: error.memberSnapshotFailure,
         })
       }
       throw error

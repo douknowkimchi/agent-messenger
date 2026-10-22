@@ -2762,6 +2762,41 @@ describe('KakaoTalkClient', () => {
       client.close()
     })
 
+    it('reports only counts and comparisons when GETMEM is incomplete', async () => {
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112))
+      mockGetAllMembers.mockResolvedValue({
+        statusCode: 0,
+        body: { members: [{ userId: makeLong(42), nickName: 'Private member name' }] },
+      })
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
+      try {
+        await client.getMemberSnapshot('100')
+        throw new Error('incomplete snapshot must fail')
+      } catch (error) {
+        expect(error).toBeInstanceOf(KakaoTalkError)
+        const failure = error as KakaoTalkError
+        expect(failure.code).toBe('get_member_snapshot_failed')
+        expect(failure.message).toBe('member_snapshot_changed_or_incomplete')
+        expect(failure.memberSnapshotFailure).toEqual({
+          firstActiveCount: 112,
+          firstMemberCount: 1,
+          secondActiveCount: 112,
+          secondMemberCount: 1,
+          displayIdsStable: true,
+          memberIdsStable: true,
+          displayMembersContained: true,
+        })
+        expect(Object.isFrozen(failure.memberSnapshotFailure)).toBe(true)
+        expect(JSON.stringify(failure.memberSnapshotFailure)).not.toContain('Private member name')
+        expect(JSON.stringify(failure.memberSnapshotFailure)).not.toContain('userId')
+      }
+      expect(mockGetChannelInfo).toHaveBeenCalledTimes(2)
+      expect(mockGetAllMembers).toHaveBeenCalledTimes(2)
+      expect(mockGetChatInfo).not.toHaveBeenCalled()
+      expect(mockMarkRead).not.toHaveBeenCalled()
+      client.close()
+    })
+
     it('returns a stable empty snapshot for a zero-member room without CHATONROOM', async () => {
       mockGetChannelInfo.mockResolvedValue(memberChannelInfo(0))
       mockGetAllMembers.mockResolvedValue({
@@ -2850,6 +2885,15 @@ describe('KakaoTalkClient', () => {
       })
       await expect(client.getMemberSnapshot('100')).rejects.toMatchObject({
         code: 'get_member_snapshot_failed',
+        memberSnapshotFailure: {
+          firstActiveCount: 2,
+          firstMemberCount: 2,
+          secondActiveCount: 3,
+          secondMemberCount: 2,
+          displayIdsStable: true,
+          memberIdsStable: true,
+          displayMembersContained: true,
+        },
       })
       expect(mockGetChatInfo).not.toHaveBeenCalled()
 
@@ -2882,6 +2926,15 @@ describe('KakaoTalkClient', () => {
       })
       await expect(client.getMemberSnapshot('100')).rejects.toMatchObject({
         code: 'get_member_snapshot_failed',
+        memberSnapshotFailure: {
+          firstActiveCount: 2,
+          firstMemberCount: 2,
+          secondActiveCount: 2,
+          secondMemberCount: 2,
+          displayIdsStable: true,
+          memberIdsStable: false,
+          displayMembersContained: true,
+        },
       })
 
       client.close()

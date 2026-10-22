@@ -8,6 +8,7 @@ import { KakaoTalkClient, KakaoTalkError } from './client'
 const mockLogin = mock(() => Promise.resolve({}))
 const mockGetChatList = mock(() => Promise.resolve({}))
 const mockGetChatLogs = mock(() => Promise.resolve({}))
+const mockEnterRoom = mock(() => Promise.resolve({}))
 const mockGetChatInfo = mock(() => Promise.resolve({}))
 const mockGetChannelInfo = mock(() => Promise.resolve({}))
 const mockGetOpenLinkInfo = mock(() => Promise.resolve({}))
@@ -28,6 +29,7 @@ mock.module('./protocol/session', () => ({
     login = mockLogin
     getChatList = mockGetChatList
     getChatLogs = mockGetChatLogs
+    enterRoom = mockEnterRoom
     getChatInfo = mockGetChatInfo
     getChannelInfo = mockGetChannelInfo
     getOpenLinkInfo = mockGetOpenLinkInfo
@@ -70,6 +72,7 @@ function resetAllMocks() {
   mockLogin.mockReset()
   mockGetChatList.mockReset()
   mockGetChatLogs.mockReset()
+  mockEnterRoom.mockReset()
   mockGetChatInfo.mockReset()
   mockGetChannelInfo.mockReset()
   mockGetOpenLinkInfo.mockReset()
@@ -2665,6 +2668,81 @@ describe('KakaoTalkClient', () => {
       }
 
       client.close()
+    })
+  })
+
+  describe('explicit member entry', () => {
+    async function connected() {
+      const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: '1' })
+      await client.getChats({ resolveTitles: false })
+      return client
+    }
+    function member(id: number) {
+      return { userId: makeLong(id), nickName: `Member ${id}` }
+    }
+    it('reads 112 members with one entry and two bounded MEMBER batches', async () => {
+      const client = await connected()
+      const rows = Array.from({ length: 112 }, (_, i) => member(i + 1))
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112, rows.slice(0, 5)))
+      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi: rows.map((m) => m.userId) } })
+      mockGetMembersByIds.mockImplementation(async (_chat, ids) => ({
+        statusCode: 0,
+        body: {
+          chatId: makeLong(100),
+          members: rows.filter((m) => ids.some((id) => id.toString() === String(m.userId.low))),
+        },
+      }))
+      const result = await client.enterRoomMemberSnapshot('100')
+      expect(result.members).toHaveLength(112)
+      expect(result.consistency_basis).toBe('entered_chatinfo_member')
+      expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(2)
+      expect(mockGetAllMembers).not.toHaveBeenCalled()
+      expect(mockMarkRead).not.toHaveBeenCalled()
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+    it('rejects partial MEMBER batches without retry or login', async () => {
+      const client = await connected()
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112))
+      mockEnterRoom.mockResolvedValue({
+        statusCode: 0,
+        body: { c: makeLong(100), mi: Array.from({ length: 112 }, (_, i) => makeLong(i + 1)) },
+      })
+      mockGetMembersByIds.mockResolvedValue({ statusCode: 0, body: { members: [member(1)] } })
+      await expect(client.enterRoomMemberSnapshot('100')).rejects.toThrow()
+      expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+    it('uses m for small rooms and rejects an incorrect room', async () => {
+      const client = await connected()
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(2, [member(1)]))
+      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [member(1), member(2)] } })
+      expect((await client.enterRoomMemberSnapshot('100')).members).toHaveLength(2)
+      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(200), m: [member(1), member(2)] } })
+      await expect(client.enterRoomMemberSnapshot('100')).rejects.toThrow()
+      expect(mockGetMembersByIds).not.toHaveBeenCalled()
+      client.close()
+    })
+    it('rejects abort before dispatch and late results after close', async () => {
+      const client = await connected()
+      await expect(client.enterRoomMemberSnapshot('100', { signal: AbortSignal.abort() })).rejects.toThrow()
+      expect(mockGetChannelInfo).not.toHaveBeenCalled()
+      let resolve!: (value: unknown) => void
+      mockGetChannelInfo.mockImplementation(
+        () =>
+          new Promise((r) => {
+            resolve = r
+          }),
+      )
+      const pending = client.enterRoomMemberSnapshot('100')
+      client.close()
+      resolve(memberChannelInfo(2))
+      await expect(pending).rejects.toThrow()
+      expect(mockEnterRoom).not.toHaveBeenCalled()
+      expect(mockLogin).toHaveBeenCalledTimes(1)
     })
   })
 

@@ -2,7 +2,7 @@ import { describe, expect, it, mock } from 'bun:test'
 
 import { Long } from 'bson'
 
-import { buildTypingActionBody, sendTypingPacket, TYPING_ACTION_METHOD } from './session'
+import { LocoSession, buildTypingActionBody, sendTypingPacket, TYPING_ACTION_METHOD } from './session'
 import type { LocoPacket } from './types'
 
 type SentPacket = { method: string; body: Record<string, unknown> }
@@ -109,5 +109,19 @@ describe('sendTypingPacket → sendPacket wire boundary', () => {
     const packet = sent[0]!
     expect(packet.method).toBe(TYPING_ACTION_METHOD)
     expect(packet.body).toEqual(buildTypingActionBody(Long.fromString('123'), Long.fromString('456')))
+  })
+})
+
+describe('explicit participant entry wire', () => {
+  it('sends one CHATONROOM with exact Long zero token/opt and room precision', async () => {
+    const { connection, sent } = fakeConnection()
+    const cid = Long.fromString('9223372036854775000')
+    await LocoSession.prototype.enterRoom.call({ connection } as unknown as LocoSession, cid)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.method).toBe('CHATONROOM')
+    expect(Object.keys(sent[0]!.body).sort()).toEqual(['chatId', 'opt', 'token'])
+    expect((sent[0]!.body.chatId as Long).toString()).toBe('9223372036854775000')
+    expect((sent[0]!.body.token as Long).toString()).toBe('0')
+    expect((sent[0]!.body.opt as Long).toString()).toBe('0')
   })
 })

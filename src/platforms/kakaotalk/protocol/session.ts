@@ -263,6 +263,14 @@ export class LocoSession {
     })
   }
 
+  /** Explicit room entry. May advance unread state; never used by background reads.
+   * node-kakao@8512e469/src/talk/channel/talk-normal-channel-session.ts.
+   */
+  async enterRoom(chatId: Long): Promise<LocoPacket> {
+    if (!this.connection) throw new Error('Not connected')
+    return this.connection.sendPacket('CHATONROOM', { chatId, token: Long.ZERO, opt: Long.ZERO })
+  }
+
   async getChatInfo(chatId: Long): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
     return this.connection.sendPacket('CHATONROOM', { chatId })

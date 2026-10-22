@@ -2706,10 +2706,16 @@ describe('KakaoTalkClient', () => {
       const client = await connected()
       const rows = Array.from({ length: 112 }, (_, i) => member(i + 1))
       mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112, rows.slice(0, 5)))
-      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi: rows.slice(1).map((m) => m.userId) } })
+      mockEnterRoom.mockResolvedValue({
+        statusCode: 0,
+        body: { c: makeLong(100), mi: rows.slice(1).map((m) => m.userId) },
+      })
       mockGetMembersByIds.mockImplementation(async (_chat, ids) => ({
         statusCode: 0,
-        body: { chatId: makeLong(100), members: rows.filter((m) => ids.some((id) => id.toString() === String(m.userId.low))) },
+        body: {
+          chatId: makeLong(100),
+          members: rows.filter((m) => ids.some((id) => id.toString() === String(m.userId.low))),
+        },
       }))
       const result = await client.enterRoomMemberSnapshot('100')
       expect(result.members).toHaveLength(112)
@@ -2741,14 +2747,68 @@ describe('KakaoTalkClient', () => {
       const client = await connected()
       const rows = Array.from({ length: 112 }, (_, i) => member(i + 1))
       mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112))
-      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi: rows.slice(1).map((m) => m.userId) } })
+      mockEnterRoom.mockResolvedValue({
+        statusCode: 0,
+        body: { c: makeLong(100), mi: rows.slice(1).map((m) => m.userId) },
+      })
       mockGetMembersByIds.mockImplementation(async (_chat, ids) => ({
         statusCode: 0,
-        body: { chatId: makeLong(100), members: rows.filter((m) => ids.some((id) => id.toString() === String(m.userId.low))).map((m) => m.userId.low === 1 ? member(113) : m) },
+        body: {
+          chatId: makeLong(100),
+          members: rows
+            .filter((m) => ids.some((id) => id.toString() === String(m.userId.low)))
+            .map((m) => (m.userId.low === 1 ? member(113) : m)),
+        },
       }))
       await expect(client.enterRoomMemberSnapshot('100')).rejects.toThrow()
       expect(mockEnterRoom).toHaveBeenCalledTimes(1)
       expect(mockGetMembersByIds).toHaveBeenCalledTimes(2)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+    it('distinguishes all entry-ID rejection inputs using counts and kinds only, without extra calls', async () => {
+      const client = await connected()
+      const ids = Array.from({ length: 112 }, (_, i) => makeLong(i + 1))
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112))
+      const cases = [
+        [{}, 'absent', null, 'absent', null, null, null],
+        [{ mi: null }, 'null', null, 'absent', null, null, null],
+        [{ mi: 'private-id-token' }, 'other', null, 'absent', null, null, null],
+        [{ mi: ids, m: [{ userId: makeLong(1), nickName: 'private-name' }] }, 'array', 112, 'array', 1, null, null],
+        [{ mi: ids, m: null }, 'array', 112, 'null', null, null, null],
+        [{ mi: ids.slice(2) }, 'array', 110, 'absent', null, null, null],
+        [{ mi: [...ids, makeLong(113)] }, 'array', 113, 'absent', null, null, null],
+        [{ mi: ids.slice(0, 111) }, 'array', 111, 'absent', null, 111, true],
+        [{ mi: [...ids.slice(1), makeLong(113)] }, 'array', 112, 'absent', null, 112, false],
+      ] as const
+      for (const [body, idsKind, idCount, recordsKind, recordCount, validatedIdCount, containsSelf] of cases) {
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), ...body } })
+        let caught: unknown
+        try {
+          await client.enterRoomMemberSnapshot('100')
+        } catch (error) {
+          caught = error
+        }
+        expect(caught).toBeInstanceOf(KakaoTalkError)
+        const error = caught as KakaoTalkError
+        expect(error.message).toBe('member_entry_ids_invalid')
+        expect(error.memberEntryFailure).toEqual({
+          activeCount: 112,
+          idsKind,
+          idCount,
+          recordsKind,
+          recordCount,
+          validatedIdCount,
+          containsSelf,
+        })
+        expect(Object.isFrozen(error.memberEntryFailure)).toBe(true)
+        expect(JSON.stringify(error.memberEntryFailure)).not.toContain('private-')
+      }
+      expect(mockEnterRoom).toHaveBeenCalledTimes(cases.length)
+      expect(mockGetChannelInfo).toHaveBeenCalledTimes(cases.length)
+      expect(mockGetMembersByIds).not.toHaveBeenCalled()
+      expect(mockGetAllMembers).not.toHaveBeenCalled()
+      expect(mockMarkRead).not.toHaveBeenCalled()
       expect(mockLogin).toHaveBeenCalledTimes(1)
       client.close()
     })

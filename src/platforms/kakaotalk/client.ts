@@ -77,6 +77,17 @@ export interface KakaoTalkMemberSnapshotFailure {
   displayMembersContained: boolean
 }
 
+/** Aggregate entry shape only; no identities, labels, tokens or response references. */
+export interface KakaoTalkMemberEntryFailure {
+  activeCount: number
+  idsKind: 'absent' | 'null' | 'array' | 'other'
+  idCount: number | null
+  recordsKind: 'absent' | 'null' | 'array' | 'other'
+  recordCount: number | null
+  validatedIdCount: number | null
+  containsSelf: boolean | null
+}
+
 export class KakaoTalkError extends Error {
   code: string
   readonly serverStatus?: number
@@ -84,6 +95,7 @@ export class KakaoTalkError extends Error {
   readonly responseStatusSource?: KakaoTalkResponseStatusSource
   readonly getChatFailureReason?: KakaoTalkGetChatFailureReason
   readonly memberSnapshotFailure?: Readonly<KakaoTalkMemberSnapshotFailure>
+  readonly memberEntryFailure?: Readonly<KakaoTalkMemberEntryFailure>
 
   constructor(
     message: string,
@@ -95,6 +107,7 @@ export class KakaoTalkError extends Error {
       responseStatusSource?: KakaoTalkResponseStatusSource
       getChatFailureReason?: KakaoTalkGetChatFailureReason
       memberSnapshotFailure?: Readonly<KakaoTalkMemberSnapshotFailure>
+      memberEntryFailure?: Readonly<KakaoTalkMemberEntryFailure>
     },
   ) {
     super(message, options)
@@ -105,6 +118,7 @@ export class KakaoTalkError extends Error {
     this.responseStatusSource = options?.responseStatusSource
     this.getChatFailureReason = options?.getChatFailureReason
     this.memberSnapshotFailure = options?.memberSnapshotFailure
+    this.memberEntryFailure = options?.memberEntryFailure
   }
 }
 
@@ -452,6 +466,7 @@ function wrapError(
       responseStatusSource: error.responseStatusSource,
       getChatFailureReason,
       memberSnapshotFailure: error.memberSnapshotFailure,
+      memberEntryFailure: error.memberEntryFailure,
     })
   }
   const message = error instanceof Error ? error.message : String(error)
@@ -1542,13 +1557,28 @@ export class KakaoTalkClient {
         if (entry.body.mi !== undefined) throw new Error('member_entry_shape_invalid')
         members = exactMemberRecords(entry.body.m, 'CHATONROOM')
       } else {
+        const idsFailure = (validatedIdCount: number | null = null, containsSelf: boolean | null = null) => {
+          const kind = (value: unknown): KakaoTalkMemberEntryFailure['idsKind'] =>
+            value === undefined ? 'absent' : value === null ? 'null' : Array.isArray(value) ? 'array' : 'other'
+          return new KakaoTalkError('member_entry_ids_invalid', 'get_member_snapshot_failed', {
+            memberEntryFailure: Object.freeze({
+              activeCount: first.activeMembers,
+              idsKind: kind(entry.body.mi),
+              idCount: Array.isArray(entry.body.mi) ? entry.body.mi.length : null,
+              recordsKind: kind(entry.body.m),
+              recordCount: Array.isArray(entry.body.m) ? entry.body.m.length : null,
+              validatedIdCount,
+              containsSelf,
+            }),
+          })
+        }
         if (
           !Array.isArray(entry.body.mi) ||
           entry.body.m !== undefined ||
           entry.body.mi.length < first.activeMembers - 1 ||
           entry.body.mi.length > first.activeMembers
         ) {
-          throw new Error('member_entry_ids_invalid')
+          throw idsFailure()
         }
         const requested = exactMemberRecords(
           entry.body.mi.map((userId: unknown) => ({ userId })),
@@ -1562,7 +1592,7 @@ export class KakaoTalkClient {
           requested.ids.add(selfUserId)
         }
         if (requested.ids.size !== first.activeMembers || !requested.ids.has(selfUserId)) {
-          throw new Error('member_entry_ids_invalid')
+          throw idsFailure(requested.ids.size, requested.ids.has(selfUserId))
         }
         const rows: Array<Record<string, unknown>> = []
         const ids = [...requested.ids]

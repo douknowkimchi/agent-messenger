@@ -1030,8 +1030,12 @@ export class KakaoTalkClient {
         throw this.blockConnectionAdmission('connection_admission_failed')
       }
       if (this.closed || signal.aborted) throw new KakaoTalkError('Client is closed', 'client_closed')
-      if (credentials.oauthToken !== this.oauthToken || credentials.userId !== this.userId ||
-          credentials.deviceUuid !== this.deviceUuid || credentials.deviceType !== this.deviceType) {
+      if (
+        credentials.oauthToken !== this.oauthToken ||
+        credentials.userId !== this.userId ||
+        credentials.deviceUuid !== this.deviceUuid ||
+        credentials.deviceType !== this.deviceType
+      ) {
         throw this.blockConnectionAdmission('connection_admission_failed')
       }
       if (admitted !== true) throw this.blockConnectionAdmission('connection_admission_denied')
@@ -1508,6 +1512,87 @@ export class KakaoTalkClient {
         throw wrapError(error, 'get_member_snapshot_failed')
       }
     })
+  }
+
+  /** Explicit entry on the current session only: no reconnect, replay or login. */
+  async enterRoomMemberSnapshot(chatId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoMemberSnapshot> {
+    const cid = parseChatId(chatId)
+    const normalizedChatId = longToString(cid)
+    const state = this.state
+    const check = () => {
+      options.signal?.throwIfAborted()
+      if (!state || this.closed || this.state !== state) {
+        throw new KakaoTalkError('member_entry_session_changed', 'get_member_snapshot_failed')
+      }
+    }
+    check()
+    const session = state!.session
+    try {
+      const before = await session.getChannelInfo(cid)
+      check()
+      assertLocoOk(before, 'CHATINFO')
+      const first = channelMemberView(before.body as Record<string, unknown>, normalizedChatId)
+      if (first.activeMembers < 1 || first.activeMembers > 5000) throw new Error('member_entry_count_invalid')
+      const entry = await session.enterRoom(cid)
+      check()
+      assertLocoOk(entry, 'CHATONROOM')
+      if (longToString(entry.body.c) !== normalizedChatId) throw new Error('member_entry_chat_mismatch')
+      let members: ReturnType<typeof exactMemberRecords>
+      if (first.activeMembers <= 100) {
+        if (entry.body.mi !== undefined) throw new Error('member_entry_shape_invalid')
+        members = exactMemberRecords(entry.body.m, 'CHATONROOM')
+      } else {
+        if (
+          !Array.isArray(entry.body.mi) ||
+          entry.body.m !== undefined ||
+          entry.body.mi.length !== first.activeMembers
+        ) {
+          throw new Error('member_entry_ids_invalid')
+        }
+        const requested = exactMemberRecords(
+          entry.body.mi.map((userId: unknown) => ({ userId })),
+          'CHATONROOM',
+        )
+        const rows: Array<Record<string, unknown>> = []
+        const ids = [...requested.ids]
+        for (let offset = 0; offset < ids.length; offset += 100) {
+          check()
+          const batch = ids.slice(offset, offset + 100)
+          const response = await session.getMembersByIds(cid, batch.map(parseUserId))
+          check()
+          assertLocoOk(response, 'MEMBER')
+          if (response.body.chatId !== undefined && longToString(response.body.chatId) !== normalizedChatId) {
+            throw new Error('member_entry_member_chat_mismatch')
+          }
+          const exact = exactMemberRecords(response.body.members, 'MEMBER')
+          if (!sameIds(new Set(batch), exact.ids)) throw new Error('member_entry_batch_incomplete')
+          rows.push(...exact.records)
+        }
+        members = exactMemberRecords(rows, 'MEMBER')
+        if (!sameIds(requested.ids, members.ids)) throw new Error('member_entry_incomplete')
+      }
+      const after = await session.getChannelInfo(cid)
+      check()
+      assertLocoOk(after, 'CHATINFO')
+      const second = channelMemberView(after.body as Record<string, unknown>, normalizedChatId)
+      if (
+        first.activeMembers !== second.activeMembers ||
+        members.records.length !== second.activeMembers ||
+        !sameIds(first.ids, second.ids) ||
+        !subsetIds(second.ids, members.ids)
+      ) {
+        throw new Error('member_entry_changed_or_incomplete')
+      }
+      return {
+        chat_id: normalizedChatId,
+        active_members: second.activeMembers,
+        members: mergeMemberRecords(members.records, second.records).map(formatMember),
+        complete: true,
+        consistency_basis: 'entered_chatinfo_member',
+      }
+    } catch (error) {
+      throw wrapError(error, 'get_member_snapshot_failed')
+    }
   }
 
   async getMembers(chatId: string): Promise<KakaoMember[]> {

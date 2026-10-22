@@ -134,7 +134,7 @@ export interface KakaoMemberSnapshot {
   active_members: number
   members: KakaoMember[]
   complete: true
-  consistency_basis: 'stable_double_read_chatinfo_getmem'
+  consistency_basis: 'stable_double_read_chatinfo_getmem' | 'entered_chatinfo_member'
 }
 
 export interface KakaoSendResult {
@@ -297,7 +297,7 @@ export const KakaoMemberSnapshotSchema = z.object({
   active_members: z.number().int().nonnegative(),
   members: z.array(KakaoMemberSchema),
   complete: z.literal(true),
-  consistency_basis: z.literal('stable_double_read_chatinfo_getmem'),
+  consistency_basis: z.enum(['stable_double_read_chatinfo_getmem', 'entered_chatinfo_member']),
 })
 
 export const KakaoSendResultSchema = z.object({

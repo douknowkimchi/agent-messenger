@@ -2702,6 +2702,43 @@ describe('KakaoTalkClient', () => {
       expect(mockLogin).toHaveBeenCalledTimes(1)
       client.close()
     })
+    it('accepts the observed 112-record m response without issuing MEMBER requests', async () => {
+      const client = await connected()
+      const rows = Array.from({ length: 112 }, (_, i) => member(i + 1))
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112, rows.slice(0, 5)))
+      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: rows } })
+      const result = await client.enterRoomMemberSnapshot('100')
+      expect(result.members).toHaveLength(112)
+      expect(result.members.filter((m) => m.user_id === '1')).toHaveLength(1)
+      expect(result.complete).toBe(true)
+      expect(mockGetChannelInfo).toHaveBeenCalledTimes(2)
+      expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      expect(mockGetMembersByIds).not.toHaveBeenCalled()
+      expect(mockGetAllMembers).not.toHaveBeenCalled()
+      expect(mockMarkRead).not.toHaveBeenCalled()
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+    it('keeps count, identity and mixed-shape guards for large inline member responses', async () => {
+      const client = await connected()
+      const rows = Array.from({ length: 112 }, (_, i) => member(i + 1))
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112, rows.slice(0, 5)))
+      for (const body of [
+        { m: rows.slice(0, 111) },
+        { m: [...rows, member(113)] },
+        { m: [...rows.slice(0, 111), member(111)] },
+        { m: [...rows.slice(1), member(113)] },
+        { m: rows, mi: rows.map((m) => m.userId) },
+      ]) {
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), ...body } })
+        await expect(client.enterRoomMemberSnapshot('100')).rejects.toThrow()
+      }
+      expect(mockGetMembersByIds).not.toHaveBeenCalled()
+      expect(mockEnterRoom).toHaveBeenCalledTimes(5)
+      expect(mockMarkRead).not.toHaveBeenCalled()
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
     it('includes the authenticated self omitted by the donor mi list without inventing members', async () => {
       const client = await connected()
       const rows = Array.from({ length: 112 }, (_, i) => member(i + 1))

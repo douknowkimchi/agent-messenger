@@ -1545,7 +1545,8 @@ export class KakaoTalkClient {
         if (
           !Array.isArray(entry.body.mi) ||
           entry.body.m !== undefined ||
-          entry.body.mi.length !== first.activeMembers
+          entry.body.mi.length < first.activeMembers - 1 ||
+          entry.body.mi.length > first.activeMembers
         ) {
           throw new Error('member_entry_ids_invalid')
         }
@@ -1553,6 +1554,16 @@ export class KakaoTalkClient {
           entry.body.mi.map((userId: unknown) => ({ userId })),
           'CHATONROOM',
         )
+        // node-kakao's normal-channel data owner fills the authenticated self
+        // when CHATONROOM mi omits it. Only that known identity may fill the
+        // one missing slot; MEMBER must still return its actual record.
+        const selfUserId = longToString(parseUserId(this.userId ?? ''))
+        if (requested.ids.size === first.activeMembers - 1 && !requested.ids.has(selfUserId)) {
+          requested.ids.add(selfUserId)
+        }
+        if (requested.ids.size !== first.activeMembers || !requested.ids.has(selfUserId)) {
+          throw new Error('member_entry_ids_invalid')
+        }
         const rows: Array<Record<string, unknown>> = []
         const ids = [...requested.ids]
         for (let offset = 0; offset < ids.length; offset += 100) {

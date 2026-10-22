@@ -2702,6 +2702,56 @@ describe('KakaoTalkClient', () => {
       expect(mockLogin).toHaveBeenCalledTimes(1)
       client.close()
     })
+    it('includes the authenticated self omitted by the donor mi list without inventing members', async () => {
+      const client = await connected()
+      const rows = Array.from({ length: 112 }, (_, i) => member(i + 1))
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112, rows.slice(0, 5)))
+      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi: rows.slice(1).map((m) => m.userId) } })
+      mockGetMembersByIds.mockImplementation(async (_chat, ids) => ({
+        statusCode: 0,
+        body: { chatId: makeLong(100), members: rows.filter((m) => ids.some((id) => id.toString() === String(m.userId.low))) },
+      }))
+      const result = await client.enterRoomMemberSnapshot('100')
+      expect(result.members).toHaveLength(112)
+      expect(result.members.filter((m) => m.user_id === '1')).toHaveLength(1)
+      expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(2)
+      const requestedIds = mockGetMembersByIds.mock.calls.flatMap((call) => call[1].map((id: Long) => id.toString()))
+      expect(requestedIds).toHaveLength(112)
+      expect(new Set(requestedIds).size).toBe(112)
+      expect(mockGetAllMembers).not.toHaveBeenCalled()
+      expect(mockMarkRead).not.toHaveBeenCalled()
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+    it('does not fill an unknown missing member or accept an extra member', async () => {
+      const client = await connected()
+      const ids = Array.from({ length: 112 }, (_, i) => makeLong(i + 1))
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112))
+      for (const mi of [ids.slice(0, 111), ids.slice(2), [...ids, makeLong(113)], [...ids.slice(1), ids[1]]]) {
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi } })
+        await expect(client.enterRoomMemberSnapshot('100')).rejects.toThrow()
+      }
+      expect(mockGetMembersByIds).not.toHaveBeenCalled()
+      expect(mockEnterRoom).toHaveBeenCalledTimes(4)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+    it('requires MEMBER to confirm the omitted self and rejects an unrelated substitute', async () => {
+      const client = await connected()
+      const rows = Array.from({ length: 112 }, (_, i) => member(i + 1))
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112))
+      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi: rows.slice(1).map((m) => m.userId) } })
+      mockGetMembersByIds.mockImplementation(async (_chat, ids) => ({
+        statusCode: 0,
+        body: { chatId: makeLong(100), members: rows.filter((m) => ids.some((id) => id.toString() === String(m.userId.low))).map((m) => m.userId.low === 1 ? member(113) : m) },
+      }))
+      await expect(client.enterRoomMemberSnapshot('100')).rejects.toThrow()
+      expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(2)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
     it('rejects partial MEMBER batches without retry or login', async () => {
       const client = await connected()
       mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112))

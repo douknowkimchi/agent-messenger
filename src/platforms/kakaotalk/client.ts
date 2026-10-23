@@ -266,6 +266,26 @@ function parseLinkId(linkId: string): Long {
   }
 }
 
+function displayMemberIds(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null
+  const ids: string[] = []
+  for (const item of value) {
+    if (typeof item === 'number') {
+      if (!Number.isSafeInteger(item) || item < 0) return null
+    } else if (typeof item === 'string' || typeof item === 'bigint') {
+      if (!/^(0|[1-9]\d*)$/.test(String(item))) return null
+    } else if (item && typeof item === 'object' && 'high' in item && 'low' in item) {
+      if (![item.high, item.low].every((part) => Number.isInteger(part) && part >= -2147483648 && part <= 4294967295)) return null
+    } else {
+      return null
+    }
+    const id = longToString(item)
+    if (BigInt(id) > 18446744073709551615n) return null
+    ids.push(id)
+  }
+  return ids
+}
+
 function formatChat(chat: ChatData, title: string | null, nameCache: MemberNameCache): KakaoChat {
   const memberNames = (chat.k ?? []) as string[]
   const lastLog = chat.l as Record<string, unknown> | null
@@ -276,6 +296,7 @@ function formatChat(chat: ChatData, title: string | null, nameCache: MemberNameC
     chat_id: chatId,
     type: requiredChatType(chat.t),
     display_name: displayName,
+    display_member_ids: displayMemberIds(chat.i),
     title,
     active_members: chat.a as number,
     unread_count: chat.n as number,

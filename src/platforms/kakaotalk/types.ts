@@ -85,6 +85,7 @@ export interface KakaoChat {
   chat_id: string
   type: KakaoChatType
   display_name: string | null
+  display_member_ids: string[] | null
   title: string | null
   active_members: number
   unread_count: number
@@ -249,6 +250,7 @@ export const KakaoChatSchema = z.object({
   chat_id: z.string(),
   type: z.union([z.number(), z.string().min(1)]),
   display_name: z.string().nullable(),
+  display_member_ids: z.array(z.string()).nullable().optional(),
   title: z.string().nullable(),
   active_members: z.number(),
   unread_count: z.number(),

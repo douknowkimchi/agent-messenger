@@ -137,6 +137,29 @@ describe('KakaoTalkClient', () => {
     resetAllMocks()
   })
 
+  describe('chat-list display member identities', () => {
+    for (const [name, input, expected] of [
+      ['present', [1, '9007199254740993'], ['1', '9007199254740993']],
+      ['absent', undefined, null],
+      ['not an array', '1', null],
+      ['empty', [], []],
+      ['Long and high bit', [Long.fromString('9007199254740993'), new Long(-1, -1)],
+        ['9007199254740993', '18446744073709551615']],
+      ...[null, {}, { high: '1', low: 0 }, { high: 1.5, low: 0 }, Number.MAX_SAFE_INTEGER + 1,
+        -1, '', '1.2', '18446744073709551616', true].map((invalid) =>
+        ['invalid element ' + JSON.stringify(invalid), [1, invalid], null]),
+    ] as Array<[string, unknown, string[] | null]>) {
+      it(name, async () => {
+        mockLogin.mockResolvedValueOnce({ ...structuredClone(DEFAULT_LOGIN_RESULT),
+          chatDatas: [{ ...DEFAULT_LOGIN_RESULT.chatDatas[0], i: input }] })
+        const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: '1' })
+        const chats = await client.getChats({ resolveTitles: false })
+        expect(chats[0].display_member_ids).toEqual(expected)
+        client.close()
+      })
+    }
+  })
+
   describe('constructor', () => {
     it('creates client with required params', async () => {
       const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1' })
@@ -1181,6 +1204,7 @@ describe('KakaoTalkClient', () => {
         chat_id: '300',
         type: 11,
         display_name: 'Alice, Bob',
+        display_member_ids: ['42', '43'],
         title: 'Late room',
         active_members: 2,
         unread_count: 4,
@@ -1529,6 +1553,7 @@ describe('KakaoTalkClient', () => {
           chat_id: '300',
           type: openChatType,
           display_name: 'Alice, Bob',
+          display_member_ids: ['42', '43'],
           title: 'Open Group Title',
           active_members: 2,
           unread_count: 0,
@@ -1645,6 +1670,7 @@ describe('KakaoTalkClient', () => {
           chat_id: '300',
           type: normalChatType,
           display_name: null,
+          display_member_ids: [],
           title: null,
           active_members: 2,
           unread_count: 0,
@@ -1720,6 +1746,7 @@ describe('KakaoTalkClient', () => {
         chat_id: '300',
         type: 'UnknownChat',
         display_name: null,
+        display_member_ids: [],
         title: null,
         active_members: 2,
         unread_count: 0,

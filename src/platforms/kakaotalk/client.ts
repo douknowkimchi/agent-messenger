@@ -19,6 +19,7 @@ import type { ChatListResponse, LocoPacket, LoginListResponse, SyncState } from 
 import {
   KAKAO_MESSAGE_TYPE,
   type KakaoChat,
+  type KakaoChatReadState,
   type KakaoDeviceType,
   type KakaoLeaveChatResult,
   type KakaoMarkReadResult,
@@ -234,6 +235,35 @@ function parseLong(s: string): Long {
   return new Long(low, high)
 }
 
+// Match longToString's unsigned interpretation of the existing BSON 64-bit
+// high/low owner. Validate before parseLong, which otherwise truncates overflow.
+function readStateId(value: unknown): string | null {
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value < 0) return null
+  } else if (typeof value === 'string' || typeof value === 'bigint') {
+    if (!/^(0|[1-9]\d*)$/.test(String(value))) return null
+  } else if (value && typeof value === 'object' && 'high' in value && 'low' in value) {
+    if (
+      ![value.high, value.low].every(
+        (part) => typeof part === 'number' && Number.isInteger(part) && part >= -2147483648 && part <= 4294967295,
+      )
+    ) {
+      return null
+    }
+  } else {
+    return null
+  }
+  const id = longToString(value)
+  return BigInt(id) <= 18446744073709551615n ? id : null
+}
+
+function parseReadStateInput(value: string, field: 'chat' | 'log' | 'link'): Long {
+  if (typeof value !== 'string' || readStateId(value) === null || value === '0') {
+    throw new KakaoTalkError(`Invalid ${field}Id: expected canonical positive uint64`, `invalid_${field}_id`)
+  }
+  return parseLong(value)
+}
+
 function parseChatId(chatId: string): Long {
   try {
     return parseLong(chatId)
@@ -320,6 +350,7 @@ interface ChannelMetaEntry {
 
 interface ChannelInfoData {
   chatId?: unknown
+  left?: unknown
   type?: unknown
   activeMembersCount?: unknown
   newMessageCount?: unknown
@@ -1249,6 +1280,48 @@ export class KakaoTalkClient {
   }
 
   /**
+   * Read only CHATINFO metadata for this exact room; no CHATONROOM, name,
+   * message or profile resolution. IDs use unsigned BSON 64-bit bit patterns
+   * (0..2^64-1), matching longToString; input chatId must be positive canonical
+   * decimal. Unusable/missing log IDs stay null, and zero is not a write target.
+   * unread_count requires invalidNewMessageCount === false and a safe count.
+   */
+  async getChatReadState(chatId: string): Promise<KakaoChatReadState> {
+    const parsedChatId = parseReadStateInput(chatId, 'chat')
+    const session = await this.acquireSession()
+    try {
+      const response = await session.getChannelInfo(parsedChatId)
+      assertLocoOk(response, 'CHATINFO')
+      const info = extractChannelInfo(response.body, chatId)
+      // extractChannelInfo owns same-room extraction; additionally reject values
+      // its legacy permissive ID conversion could truncate or round.
+      if (readStateId(info.chatId) !== chatId || (info.left !== undefined && info.left !== false)) {
+        throw new Error('CHATINFO response invalid or left room')
+      }
+      const type = requiredChatType(info.type)
+      if ((typeof type === 'number' && !Number.isSafeInteger(type)) || (typeof type === 'string' && !type.trim())) {
+        throw new Error('CHATINFO response invalid type')
+      }
+      const linkId = isOpenKakaoChatType(type) ? readStateId(info.li) : null
+      return {
+        chat_id: chatId,
+        type,
+        last_message_id: readStateId(info.lastLogId),
+        last_read_message_id: readStateId(info.lastSeenLogId),
+        link_id: linkId === '0' ? null : linkId,
+        unread_count:
+          info.invalidNewMessageCount === false &&
+          Number.isSafeInteger(info.newMessageCount) &&
+          (info.newMessageCount as number) >= 0
+            ? (info.newMessageCount as number)
+            : null,
+      }
+    } catch (error) {
+      throw wrapError(error, 'get_chat_read_state_failed', { classifyResponseFailure: true })
+    }
+  }
+
+  /**
    * Fetch one chat directly by id via read-only CHATINFO.
    *
    * Unlike `getChats()`, this does not depend on the login-time snapshot or
@@ -2038,6 +2111,39 @@ export class KakaoTalkClient {
         throw wrapError(error, opts.errorCode)
       }
     })
+  }
+
+  /**
+   * Opt-in single dispatch: acquire the existing session once and never replay
+   * after NOTIREAD, including session replacement/close. Inputs are canonical
+   * positive unsigned 64-bit decimal strings (1..2^64-1). Pass the verified room
+   * linkId for open chats, omit for normal chats; this does not verify log/link
+   * membership. Only an explicit integer body.status is a provider result.
+   * Header/transport/missing-ack failures throw mark_read_unknown with
+   * responseFailureKind=transient_or_unknown. Do not automatically retry.
+   * Result chat_id/watermark are input echoes, not applied state or unread proof.
+   */
+  async markReadOnce(chatId: string, logId: string, opts?: { linkId?: string }): Promise<KakaoMarkReadResult> {
+    const parsedChatId = parseReadStateInput(chatId, 'chat')
+    const parsedWatermark = parseReadStateInput(logId, 'log')
+    const parsedLinkId = opts?.linkId !== undefined ? parseReadStateInput(opts.linkId, 'link') : undefined
+    const session = await this.acquireSession()
+    try {
+      const response = await session.markRead(parsedChatId, parsedWatermark, parsedLinkId)
+      if (response.statusCode !== 0) {
+        throw new LocoResponseError('NOTIREAD outcome unknown: header failure', 'transient_or_unknown', {
+          serverStatus: Number.isSafeInteger(response.statusCode) ? response.statusCode : undefined,
+          responseStatusSource: 'packet',
+        })
+      }
+      const status = response.body?.status
+      if (typeof status !== 'number' || !Number.isSafeInteger(status)) {
+        throw new Error('NOTIREAD outcome unknown: explicit integer body.status missing')
+      }
+      return { success: status === 0, status_code: status, chat_id: chatId, watermark: logId }
+    } catch (error) {
+      throw wrapError(error, 'mark_read_unknown', { classifyResponseFailure: true })
+    }
   }
 
   /**

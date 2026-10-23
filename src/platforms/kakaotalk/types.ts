@@ -81,6 +81,21 @@ export function isKnownKakaoChatStringType(value: unknown): value is (typeof KNO
   )
 }
 
+/** Read-only same-room CHATINFO metadata; no message/member/profile contents. */
+export interface KakaoChatReadState {
+  /** Canonical positive unsigned 64-bit decimal string. */
+  chat_id: string
+  type: KakaoChatType
+  /** Canonical uint64 string, zero allowed; null means absent or unusable. */
+  last_message_id: string | null
+  /** Raw lastSeenLogId metadata; self-watermark semantics need provider verification. */
+  last_read_message_id: string | null
+  /** Positive room li for an open chat only; never a member profile link. */
+  link_id: string | null
+  /** Non-negative safe integer only when the provider explicitly marks it valid. */
+  unread_count: number | null
+}
+
 export interface KakaoChat {
   chat_id: string
   type: KakaoChatType

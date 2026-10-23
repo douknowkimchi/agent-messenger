@@ -19,6 +19,7 @@ export type {
   KakaoAuthErrorCode,
   KakaoAuthMethod,
   KakaoChat,
+  KakaoChatReadState,
   KakaoChatType,
   KakaoOpenChatType,
   KakaoConfig,

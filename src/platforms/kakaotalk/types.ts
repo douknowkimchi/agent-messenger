@@ -161,6 +161,29 @@ export interface KakaoSendResult {
   sent_at: number
 }
 
+export type KakaoCreateDirectChatResult =
+  | {
+      success: true
+      status_code: 0
+      outcome: 'created'
+      peer_id: string
+      chat_id: string
+    }
+  | {
+      success: true
+      status_code: -310
+      outcome: 'existing'
+      peer_id: string
+      chat_id: string
+    }
+  | {
+      success: false
+      status_code: number
+      outcome: 'rejected'
+      peer_id: string
+      chat_id: null
+    }
+
 // LOCO message_type values. Source: KakaoTalk APK 26.4.2 + typeclaw inbound parser.
 export const KAKAO_MESSAGE_TYPE = {
   TEXT: 1,
@@ -324,6 +347,30 @@ export const KakaoSendResultSchema = z.object({
   log_id: z.string(),
   sent_at: z.number(),
 })
+
+export const KakaoCreateDirectChatResultSchema = z.discriminatedUnion('outcome', [
+  z.object({
+    success: z.literal(true),
+    status_code: z.literal(0),
+    outcome: z.literal('created'),
+    peer_id: z.string(),
+    chat_id: z.string(),
+  }),
+  z.object({
+    success: z.literal(true),
+    status_code: z.literal(-310),
+    outcome: z.literal('existing'),
+    peer_id: z.string(),
+    chat_id: z.string(),
+  }),
+  z.object({
+    success: z.literal(false),
+    status_code: z.number().int().refine((value) => value !== 0 && value !== -310),
+    outcome: z.literal('rejected'),
+    peer_id: z.string(),
+    chat_id: z.null(),
+  }),
+])
 
 export const KakaoMarkReadResultSchema = z.object({
   success: z.boolean(),

@@ -9,6 +9,7 @@ import {
   KakaoCredentialManager,
   KakaoChatSchema,
   KakaoConfigSchema,
+  KakaoCreateDirectChatResultSchema,
   KakaoLeaveChatResultSchema,
   KakaoMessagePageSchema,
   KakaoMessageSchema,
@@ -86,6 +87,24 @@ it('KakaoMessagePageSchema is exported from barrel', () => {
 
 it('KakaoSendResultSchema is exported from barrel', () => {
   expect(typeof KakaoSendResultSchema.parse).toBe('function')
+})
+
+it('KakaoCreateDirectChatResultSchema is exported and keeps created/existing distinct', () => {
+  expect(typeof KakaoCreateDirectChatResultSchema.parse).toBe('function')
+  expect(KakaoCreateDirectChatResultSchema.parse({
+    success: true,
+    status_code: -310,
+    outcome: 'existing',
+    peer_id: '7',
+    chat_id: '11',
+  }).outcome).toBe('existing')
+  expect(() => KakaoCreateDirectChatResultSchema.parse({
+    success: true,
+    status_code: 0,
+    outcome: 'existing',
+    peer_id: '7',
+    chat_id: '11',
+  })).toThrow()
 })
 
 it('KakaoAccountCredentialsSchema is exported from barrel', () => {

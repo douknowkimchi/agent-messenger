@@ -1,8 +1,16 @@
 import { describe, expect, it, mock } from 'bun:test'
 
-import { Long } from 'bson'
+import { deserialize, Long, serialize } from 'bson'
 
-import { LocoSession, buildTypingActionBody, sendTypingPacket, TYPING_ACTION_METHOD } from './session'
+import {
+  CREATE_DIRECT_CHAT_METHOD,
+  LocoSession,
+  buildCreateDirectChatBody,
+  buildTypingActionBody,
+  sendCreateDirectChatPacket,
+  sendTypingPacket,
+  TYPING_ACTION_METHOD,
+} from './session'
 import type { LocoPacket } from './types'
 
 type SentPacket = { method: string; body: Record<string, unknown> }
@@ -110,6 +118,39 @@ describe('sendTypingPacket → sendPacket wire boundary', () => {
     expect(packet.method).toBe(TYPING_ACTION_METHOD)
     expect(packet.body).toEqual(buildTypingActionBody(Long.fromString('123'), Long.fromString('456')))
   })
+})
+
+describe('direct chat CREATE wire contract', () => {
+  it('builds exactly one memberIds entry and preserves full signed-64 precision', () => {
+    const peer = Long.fromString('9223372036854775807')
+    const body = buildCreateDirectChatBody(peer)
+
+    expect(Object.keys(body)).toEqual(['memberIds'])
+    expect(body.memberIds).toEqual([peer])
+    const decoded = deserialize(serialize(body)) as { memberIds: Long[] }
+    expect(decoded.memberIds).toHaveLength(1)
+    expect(decoded.memberIds[0]).toBeInstanceOf(Long)
+    expect(decoded.memberIds[0]!.toString()).toBe('9223372036854775807')
+  })
+
+  it('sends CREATE exactly once with no nickname, profile or room-list fields', async () => {
+    const { connection, sent, sendPacketMock } = fakeConnection({
+      statusCode: -310,
+      body: { chatId: Long.fromString('459750513901477') },
+    })
+    const peer = Long.fromString('9007199254740993')
+
+    const result = await sendCreateDirectChatPacket(connection, peer)
+
+    expect(sendPacketMock).toHaveBeenCalledTimes(1)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.method).toBe(CREATE_DIRECT_CHAT_METHOD)
+    expect(Object.keys(sent[0]!.body)).toEqual(['memberIds'])
+    expect((sent[0]!.body.memberIds as Long[])[0]!.toString()).toBe('9007199254740993')
+    expect(result.statusCode).toBe(-310)
+    expect((result.body.chatId as Long).toString()).toBe('459750513901477')
+  })
+
 })
 
 describe('explicit participant entry wire', () => {

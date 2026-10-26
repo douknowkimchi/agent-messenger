@@ -20,6 +20,7 @@ import {
   KAKAO_MESSAGE_TYPE,
   type KakaoChat,
   type KakaoChatReadState,
+  type KakaoCreateDirectChatResult,
   type KakaoDeviceType,
   type KakaoLeaveChatResult,
   type KakaoMarkReadResult,
@@ -255,6 +256,26 @@ function readStateId(value: unknown): string | null {
   }
   const id = longToString(value)
   return BigInt(id) <= 18446744073709551615n ? id : null
+}
+
+const MAX_SIGNED_INT64 = 9223372036854775807n
+
+function positiveSignedInt64String(value: unknown): string | null {
+  const normalized = readStateId(value)
+  if (normalized === null) return null
+  const id = BigInt(normalized)
+  return id > 0n && id <= MAX_SIGNED_INT64 ? normalized : null
+}
+
+function parsePositiveSignedInt64(value: string, field: 'peer'): Long {
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
+    throw new KakaoTalkError(`Invalid ${field}Id: expected canonical positive int64`, `invalid_${field}_id`)
+  }
+  const id = BigInt(value)
+  if (id > MAX_SIGNED_INT64) {
+    throw new KakaoTalkError(`Invalid ${field}Id: expected canonical positive int64`, `invalid_${field}_id`)
+  }
+  return parseLong(value)
 }
 
 function parseReadStateInput(value: string, field: 'chat' | 'log' | 'link'): Long {
@@ -2111,6 +2132,48 @@ export class KakaoTalkClient {
         throw wrapError(error, opts.errorCode)
       }
     })
+  }
+
+  /**
+   * Create-or-resolve one normal direct chat with exactly one peer.
+   *
+   * This is intentionally single-dispatch. It acquires one ready session, sends
+   * CREATE once, and never passes through executeWithReconnect. The current
+   * Android donor maps status 0 to a newly created room and -310 to an existing
+   * room; both must carry a canonical positive signed-64 chatId. Any missing or
+   * malformed acknowledgement is outcome-unknown and must not be auto-retried.
+   */
+  async createDirectChatOnce(peerId: string): Promise<KakaoCreateDirectChatResult> {
+    const parsedPeerId = parsePositiveSignedInt64(peerId, 'peer')
+    const session = await this.acquireSession()
+    try {
+      const response = await session.createDirectChat(parsedPeerId)
+      const status = response.statusCode
+      if (!Number.isSafeInteger(status) || isSyntheticConnectionClose(response)) {
+        throw new LocoResponseError('CREATE outcome unknown: transport acknowledgement missing', 'transient_or_unknown', {
+          serverStatus: Number.isSafeInteger(status) ? status : undefined,
+          responseStatusSource: Number.isSafeInteger(status) ? 'packet' : undefined,
+        })
+      }
+      if (status !== 0 && status !== -310) {
+        return {
+          success: false,
+          status_code: status,
+          outcome: 'rejected',
+          peer_id: peerId,
+          chat_id: null,
+        }
+      }
+      const chatId = positiveSignedInt64String(response.body?.chatId)
+      if (chatId === null) {
+        throw new Error('CREATE outcome unknown: canonical positive chatId missing')
+      }
+      return status === 0
+        ? { success: true, status_code: 0, outcome: 'created', peer_id: peerId, chat_id: chatId }
+        : { success: true, status_code: -310, outcome: 'existing', peer_id: peerId, chat_id: chatId }
+    } catch (error) {
+      throw wrapError(error, 'create_direct_chat_unknown', { classifyResponseFailure: true })
+    }
   }
 
   /**

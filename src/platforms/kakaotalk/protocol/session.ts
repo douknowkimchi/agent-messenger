@@ -48,6 +48,23 @@ export async function sendTypingPacket(
   return connection.sendPacket(TYPING_ACTION_METHOD, buildTypingActionBody(chatId, linkId))
 }
 
+// CREATE for one normal 1:1 chat. The current Android donor treats status 0
+// as newly created and -310 as an existing room; both responses carry chatId.
+// This helper only owns the exact wire packet. Retry policy belongs to the
+// public client method, which deliberately dispatches it at most once.
+export const CREATE_DIRECT_CHAT_METHOD = 'CREATE'
+
+export function buildCreateDirectChatBody(peerId: Long): Record<string, unknown> {
+  return { memberIds: [peerId] }
+}
+
+export async function sendCreateDirectChatPacket(
+  connection: { sendPacket: (method: string, body: Record<string, unknown>) => Promise<LocoPacket> },
+  peerId: Long,
+): Promise<LocoPacket> {
+  return connection.sendPacket(CREATE_DIRECT_CHAT_METHOD, buildCreateDirectChatBody(peerId))
+}
+
 export class LocoSession {
   private connection: LocoConnection | null = null
   private pingTimer: ReturnType<typeof setInterval> | null = null
@@ -162,6 +179,11 @@ export class LocoSession {
       type: 1,
       noSeen: false,
     })
+  }
+
+  async createDirectChat(peerId: Long): Promise<LocoPacket> {
+    if (!this.connection) throw new Error('Not connected')
+    return sendCreateDirectChatPacket(this.connection, peerId)
   }
 
   // Quoted reply — a WRITE with message_type 26 (REPLY) whose `extra` JSON

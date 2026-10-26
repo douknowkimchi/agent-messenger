@@ -17,6 +17,7 @@ const mockGetMembersByIds = mock(() => Promise.resolve({}))
 const mockSyncMessages = mock(() => Promise.resolve({}))
 const mockSendMessage = mock(() => Promise.resolve({}))
 const mockSendReply = mock(() => Promise.resolve({}))
+const mockCreateDirectChat = mock(() => Promise.resolve({}))
 const mockMarkRead = mock(() => Promise.resolve({}))
 const mockLeaveChat = mock(() => Promise.resolve({}))
 const mockSendTyping = mock(() => Promise.resolve({}))
@@ -38,6 +39,7 @@ mock.module('./protocol/session', () => ({
     syncMessages = mockSyncMessages
     sendMessage = mockSendMessage
     sendReply = mockSendReply
+    createDirectChat = mockCreateDirectChat
     markRead = mockMarkRead
     leaveChat = mockLeaveChat
     sendTyping = mockSendTyping
@@ -81,6 +83,7 @@ function resetAllMocks() {
   mockSyncMessages.mockReset()
   mockSendMessage.mockReset()
   mockSendReply.mockReset()
+  mockCreateDirectChat.mockReset()
   mockMarkRead.mockReset()
   mockLeaveChat.mockReset()
   mockSendTyping.mockReset()
@@ -2236,6 +2239,101 @@ describe('KakaoTalkClient', () => {
 
       client.close()
     })
+  })
+
+  describe('createDirectChatOnce', () => {
+    it('dispatches CREATE once and returns a newly created full-width chat id', async () => {
+      mockCreateDirectChat.mockResolvedValueOnce({
+        statusCode: 0,
+        body: { chatId: Long.fromString('9007199254740993') },
+      })
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: '1', deviceUuid: 'device1' })
+
+      await expect(client.createDirectChatOnce('9223372036854775807')).resolves.toEqual({
+        success: true,
+        status_code: 0,
+        outcome: 'created',
+        peer_id: '9223372036854775807',
+        chat_id: '9007199254740993',
+      })
+      expect(mockCreateDirectChat).toHaveBeenCalledTimes(1)
+      const [peer] = mockCreateDirectChat.mock.calls[0] as [Long]
+      expect(peer).toBeInstanceOf(Long)
+      expect(peer.toString()).toBe('9223372036854775807')
+      client.close()
+    })
+
+    it('treats -310 with chatId as the existing direct room', async () => {
+      mockCreateDirectChat.mockResolvedValueOnce({
+        statusCode: -310,
+        body: { chatId: Long.fromString('459750513901477') },
+      })
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: '1', deviceUuid: 'device1' })
+
+      await expect(client.createDirectChatOnce('9007199254740993')).resolves.toEqual({
+        success: true,
+        status_code: -310,
+        outcome: 'existing',
+        peer_id: '9007199254740993',
+        chat_id: '459750513901477',
+      })
+      expect(mockCreateDirectChat).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    it('returns a definite provider rejection without inventing a room id', async () => {
+      mockCreateDirectChat.mockResolvedValueOnce({ statusCode: -500, body: {} })
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: '1', deviceUuid: 'device1' })
+
+      await expect(client.createDirectChatOnce('7')).resolves.toEqual({
+        success: false,
+        status_code: -500,
+        outcome: 'rejected',
+        peer_id: '7',
+        chat_id: null,
+      })
+      expect(mockCreateDirectChat).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    for (const chatId of [undefined, 0, '01', '9223372036854775808', new Long(-1, -1)]) {
+      it(`classifies successful CREATE with unusable chatId ${String(chatId)} as unknown and never retries`, async () => {
+        mockCreateDirectChat.mockResolvedValueOnce({ statusCode: 0, body: { chatId } })
+        const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: '1', deviceUuid: 'device1' })
+
+        await expect(client.createDirectChatOnce('7')).rejects.toMatchObject({
+          code: 'create_direct_chat_unknown',
+          responseFailureKind: 'transient_or_unknown',
+        })
+        expect(mockCreateDirectChat).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+    }
+
+    it('does not replay CREATE after the captured session closes during the operation', async () => {
+      mockCreateDirectChat.mockImplementationOnce(async () => {
+        const closeHandler = mockOnClose.mock.calls.at(-1)?.[0] as (() => void) | undefined
+        closeHandler?.()
+        throw new Error('Synthetic socket close')
+      })
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: '1', deviceUuid: 'device1' })
+
+      await expect(client.createDirectChatOnce('7')).rejects.toMatchObject({ code: 'create_direct_chat_unknown' })
+      expect(mockCreateDirectChat).toHaveBeenCalledTimes(1)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    for (const peerId of ['', '0', '01', '-1', '1.0', '9223372036854775808']) {
+      it(`rejects non-canonical peer id ${JSON.stringify(peerId)} before session acquisition`, async () => {
+        const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: '1', deviceUuid: 'device1' })
+
+        await expect(client.createDirectChatOnce(peerId)).rejects.toMatchObject({ code: 'invalid_peer_id' })
+        expect(mockCreateDirectChat).not.toHaveBeenCalled()
+        expect(mockLogin).not.toHaveBeenCalled()
+        client.close()
+      })
+    }
   })
 
   describe('sendMessage', () => {

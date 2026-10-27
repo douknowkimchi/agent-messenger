@@ -130,9 +130,10 @@ describe('KakaoTalkClient', () => {
     // Deep-clone so tests that mutate loginResult.chatDatas (e.g. leaveChat)
     // don't leak into subsequent tests.
     mockLogin.mockResolvedValue(structuredClone(DEFAULT_LOGIN_RESULT))
-    mockGetChatLogs.mockResolvedValue({ body: { status: 0, chatLogs: [], eof: true } })
+    mockGetChatLogs.mockResolvedValue({ statusCode: 0, body: { status: 0, chatLogs: [], eof: true } })
+    mockGetChannelInfo.mockResolvedValue({ statusCode: 0, body: { chatInfo: { chatId: 100, lastLogId: 0 } } })
     mockGetChatInfo.mockResolvedValue({ body: { l: makeLong(99999) } })
-    mockSyncMessages.mockResolvedValue({ body: { status: 0, isOK: true, chatLogs: [] } })
+    mockSyncMessages.mockResolvedValue({ statusCode: 0, body: { status: 0, isOK: true, chatLogs: [] } })
   })
 
   afterEach(() => {
@@ -1953,13 +1954,16 @@ describe('KakaoTalkClient', () => {
     })
 
     it('falls back to SYNCMSG when MCHATLOGS succeeds with an empty result', async () => {
+      mockGetChannelInfo.mockResolvedValueOnce({ statusCode: 0, body: { chatInfo: { chatId: 100, lastLogId: 10 } } })
       const loginResult = structuredClone(DEFAULT_LOGIN_RESULT)
       loginResult.chatDatas[0]!.ll = makeLong(10)
       mockLogin.mockResolvedValueOnce(loginResult)
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: { status: 0, chatLogs: [], eof: true },
       })
       mockSyncMessages.mockResolvedValueOnce({
+        statusCode: 0,
         body: {
           status: 0,
           isOK: true,
@@ -1982,7 +1986,9 @@ describe('KakaoTalkClient', () => {
     })
 
     it('does not enter or sync a room when the MCHATLOGS cursor is already current', async () => {
+      mockGetChannelInfo.mockResolvedValueOnce({ statusCode: 0, body: { chatInfo: { chatId: 100, lastLogId: 999 } } })
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: { status: 0, chatLogs: [], eof: true },
       })
 
@@ -1996,14 +2002,17 @@ describe('KakaoTalkClient', () => {
       client.close()
     })
 
-    it('uses SYNCMSG without entering the room when the chat-list watermark is ahead of the cursor', async () => {
+    it('uses fresh CHATINFO for SYNCMSG without entering the room', async () => {
+      mockGetChannelInfo.mockResolvedValueOnce({ statusCode: 0, body: { chatInfo: { chatId: 100, lastLogId: 10 } } })
       const loginResult = structuredClone(DEFAULT_LOGIN_RESULT)
       loginResult.chatDatas[0]!.ll = makeLong(10)
       mockLogin.mockResolvedValueOnce(loginResult)
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: { status: 0, chatLogs: [], eof: true },
       })
       mockSyncMessages.mockResolvedValueOnce({
+        statusCode: 0,
         body: {
           status: 0,
           isOK: true,
@@ -2025,16 +2034,19 @@ describe('KakaoTalkClient', () => {
       client.close()
     })
 
-    it('uses the last-message log ID when the primary chat-list watermark is missing', async () => {
+    it('uses fresh CHATINFO when the primary chat-list watermark is missing', async () => {
+      mockGetChannelInfo.mockResolvedValueOnce({ statusCode: 0, body: { chatInfo: { chatId: 100, lastLogId: 12 } } })
       const loginResult = structuredClone(DEFAULT_LOGIN_RESULT)
       const chat = loginResult.chatDatas[0]! as Record<string, unknown>
       delete chat.ll
       chat.l = { logId: makeLong(12) }
       mockLogin.mockResolvedValueOnce(loginResult)
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: { status: 0, chatLogs: [], eof: true },
       })
       mockSyncMessages.mockResolvedValueOnce({
+        statusCode: 0,
         body: {
           status: 0,
           isOK: true,
@@ -2056,16 +2068,16 @@ describe('KakaoTalkClient', () => {
       client.close()
     })
 
-    it('returns empty without entering the room when no chat-list watermark is available', async () => {
+    it('rejects unknown history when neither login nor CHATINFO provides a watermark', async () => {
+      mockGetChannelInfo.mockResolvedValueOnce({ statusCode: 0, body: { chatInfo: { chatId: 100 } } })
       mockLogin.mockResolvedValueOnce({ ...structuredClone(DEFAULT_LOGIN_RESULT), chatDatas: [] })
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: { status: 0, chatLogs: [], eof: true },
       })
 
       const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
-      const messages = await client.getMessages('100')
-
-      expect(messages).toEqual([])
+      await expect(client.getMessages('100')).rejects.toMatchObject({ code: 'get_messages_failed' })
       expect(mockGetChatInfo).not.toHaveBeenCalled()
       expect(mockSyncMessages).not.toHaveBeenCalled()
 
@@ -2074,6 +2086,7 @@ describe('KakaoTalkClient', () => {
 
     it('returns formatted messages', async () => {
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: {
           status: 0,
           chatLogs: [
@@ -2112,6 +2125,7 @@ describe('KakaoTalkClient', () => {
 
     it('resolves author_name for known members from the chat list cache', async () => {
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: {
           status: 0,
           chatLogs: [
@@ -2146,6 +2160,7 @@ describe('KakaoTalkClient', () => {
       }))
 
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: { status: 0, chatLogs: logs, eof: true },
       })
 
@@ -2162,6 +2177,7 @@ describe('KakaoTalkClient', () => {
 
     it('sorts messages by sent_at ascending', async () => {
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: {
           status: 0,
           chatLogs: [
@@ -2183,6 +2199,7 @@ describe('KakaoTalkClient', () => {
 
     it('parses chatLog.attachment JSON for photo messages', async () => {
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: {
           status: 0,
           chatLogs: [
@@ -2215,6 +2232,7 @@ describe('KakaoTalkClient', () => {
 
     it('returns null attachment for malformed JSON', async () => {
       mockGetChatLogs.mockResolvedValueOnce({
+        statusCode: 0,
         body: {
           status: 0,
           chatLogs: [

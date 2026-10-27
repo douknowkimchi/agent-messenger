@@ -23,6 +23,7 @@ import {
   type KakaoCreateDirectChatResult,
   type KakaoDeviceType,
   type KakaoLeaveChatResult,
+  type KakaoLeaveChatOnceResult,
   type KakaoMarkReadResult,
   type KakaoMember,
   type KakaoMemberSnapshot,
@@ -267,7 +268,7 @@ function positiveSignedInt64String(value: unknown): string | null {
   return id > 0n && id <= MAX_SIGNED_INT64 ? normalized : null
 }
 
-function parsePositiveSignedInt64(value: string, field: 'peer'): Long {
+function parsePositiveSignedInt64(value: string, field: 'peer' | 'chat'): Long {
   if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
     throw new KakaoTalkError(`Invalid ${field}Id: expected canonical positive int64`, `invalid_${field}_id`)
   }
@@ -2273,6 +2274,43 @@ export class KakaoTalkClient {
         throw wrapError(error, 'leave_chat_failed')
       }
     })
+  }
+
+  /**
+   * Leave one chat with exactly one LEAVE.
+   *
+   * Single-dispatch counterpart of leaveChat: one ready session, one LEAVE,
+   * never executeWithReconnect. As in the KiwiTalk donor (7e8bcc34,
+   * talk-loco-client channel leave; headless-talk removes the channel after
+   * success), only status 0 means the account left; the chat then leaves this
+   * login's cached list. Any other integer status is a provider rejection. A
+   * missing or malformed acknowledgement is outcome-unknown and must not be
+   * auto-retried.
+   */
+  async leaveChatOnce(chatId: string): Promise<KakaoLeaveChatOnceResult> {
+    const parsedChatId = parsePositiveSignedInt64(chatId, 'chat')
+    const state = await this.ensureSession()
+    try {
+      const response = await state.session.leaveChat(parsedChatId)
+      const status = response.statusCode
+      if (!Number.isSafeInteger(status) || isSyntheticConnectionClose(response)) {
+        throw new LocoResponseError('LEAVE outcome unknown: transport acknowledgement missing', 'transient_or_unknown', {
+          serverStatus: Number.isSafeInteger(status) ? status : undefined,
+          responseStatusSource: Number.isSafeInteger(status) ? 'packet' : undefined,
+        })
+      }
+      if (status !== 0) {
+        return { success: false, status_code: status, outcome: 'rejected', chat_id: chatId }
+      }
+      const normalizedChatId = longToString(parsedChatId)
+      const raw = (state.loginResult.chatDatas ?? []) as ChatData[]
+      const index = raw.findIndex((chat) => longToString(chat.c) === normalizedChatId)
+      if (index !== -1) raw.splice(index, 1)
+      this.nameCache.forget(normalizedChatId)
+      return { success: true, status_code: 0, outcome: 'left', chat_id: chatId }
+    } catch (error) {
+      throw wrapError(error, 'leave_chat_unknown', { classifyResponseFailure: true })
+    }
   }
 
   async getProfile(): Promise<KakaoProfile> {

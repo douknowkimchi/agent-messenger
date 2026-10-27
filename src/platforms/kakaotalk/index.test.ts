@@ -10,6 +10,7 @@ import {
   KakaoChatSchema,
   KakaoConfigSchema,
   KakaoCreateDirectChatResultSchema,
+  KakaoLeaveChatOnceResultSchema,
   KakaoLeaveChatResultSchema,
   KakaoMessagePageSchema,
   KakaoMessageSchema,
@@ -155,4 +156,11 @@ it('Kakao OAuth refresh API is exported from barrel', () => {
 
   const options: KakaoOAuthRefreshOptions = { timeoutMs: 5_000 }
   expect(options.timeoutMs).toBe(5_000)
+})
+
+it('KakaoLeaveChatOnceResultSchema is exported and separates left from rejected', () => {
+  expect(KakaoLeaveChatOnceResultSchema.parse({ success: true, status_code: 0, outcome: 'left', chat_id: '100' }).outcome).toBe('left')
+  expect(KakaoLeaveChatOnceResultSchema.parse({ success: false, status_code: -805, outcome: 'rejected', chat_id: '100' }).outcome).toBe('rejected')
+  expect(() => KakaoLeaveChatOnceResultSchema.parse({ success: false, status_code: 0, outcome: 'rejected', chat_id: '100' })).toThrow()
+  expect(() => KakaoLeaveChatOnceResultSchema.parse({ success: true, status_code: -805, outcome: 'left', chat_id: '100' })).toThrow()
 })

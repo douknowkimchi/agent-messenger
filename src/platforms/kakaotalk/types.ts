@@ -278,6 +278,20 @@ export interface KakaoLeaveChatResult {
   chat_id: string
 }
 
+export type KakaoLeaveChatOnceResult =
+  | {
+      success: true
+      status_code: 0
+      outcome: 'left'
+      chat_id: string
+    }
+  | {
+      success: false
+      status_code: number
+      outcome: 'rejected'
+      chat_id: string
+    }
+
 export interface KakaoTypingResult {
   success: boolean
   status_code: number
@@ -384,6 +398,21 @@ export const KakaoLeaveChatResultSchema = z.object({
   status_code: z.number(),
   chat_id: z.string(),
 })
+
+export const KakaoLeaveChatOnceResultSchema = z.discriminatedUnion('outcome', [
+  z.object({
+    success: z.literal(true),
+    status_code: z.literal(0),
+    outcome: z.literal('left'),
+    chat_id: z.string(),
+  }),
+  z.object({
+    success: z.literal(false),
+    status_code: z.number().int().refine((value) => value !== 0),
+    outcome: z.literal('rejected'),
+    chat_id: z.string(),
+  }),
+])
 
 export const KakaoTypingResultSchema = z.object({
   success: z.boolean(),

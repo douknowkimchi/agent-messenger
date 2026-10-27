@@ -488,14 +488,6 @@ function getOpenLinkId(chat: ChatData): Long | null {
   return bsonToLong(linkId) ?? null
 }
 
-function getLoginMaxLogId(loginResult: LoginListResponse, chatId: string): Long | null {
-  const chat = (loginResult.chatDatas ?? []).find((entry) => longToString(entry.c) === chatId)
-  if (!chat) return null
-
-  const lastLog = chat.l as Record<string, unknown> | null | undefined
-  return bsonToLong(chat.ll) ?? bsonToLong(lastLog?.logId) ?? null
-}
-
 function matchesSearch(chat: ChatData, term: string): boolean {
   const names = (chat.k ?? []) as string[]
   const lower = term.toLowerCase()
@@ -1498,7 +1490,7 @@ export class KakaoTalkClient {
   }
 
   async getMessages(chatId: string, options?: { count?: number; from?: string }): Promise<KakaoMessage[]> {
-    return this.executeWithReconnect(async ({ session, loginResult }) => {
+    return this.executeWithReconnect(async ({ session }) => {
       try {
         const count = options?.count ?? 20
         const cursor = options?.from ? parseLong(options.from) : undefined
@@ -1512,10 +1504,8 @@ export class KakaoTalkClient {
         try {
           for (let page = 0; page < MAX_PAGES; page++) {
             const response = await session.getChatLogs([cid], [cur])
-            const responseStatus = response.body.status
-            if (typeof responseStatus === 'number' && responseStatus !== 0) {
-              throw new Error(`MCHATLOGS failed: ${responseStatus}`)
-            }
+            assertLocoOk(response, 'MCHATLOGS')
+            if (!Array.isArray(response.body.chatLogs)) throw new Error('message_history_invalid')
 
             const batch = ((response.body.chatLogs ?? []) as Array<Record<string, unknown>>).filter(
               (log) => longToString(log.chatId) === chatId,
@@ -1534,39 +1524,50 @@ export class KakaoTalkClient {
             }
 
             const maxLog = findMaxLogId(batch, 'logId')
-            if (!maxLog || maxLog.equals(cur) || response.body.eof) {
+            if (!maxLog || maxLog.lessThanOrEqual(cur)) throw new Error('message_history_stalled')
+            if (response.body.eof === true) {
               return formatMessages(allMessages, count, chatId, this.nameCache)
             }
 
             cur = maxLog
           }
-        } catch {
+        } catch (error) {
+          // Let the existing reconnect owner replace a dead session once.
+          if (this.state?.session !== session) throw error
           allMessages.length = 0
           seenLogIds.clear()
           cur = cursor ?? Long.fromNumber(0)
         }
 
         if (allMessages.length > 0) {
-          warn(`[agent-kakaotalk] Warning: message fetch capped at ${MAX_PAGES} pages. Results may be incomplete.`)
-          return formatMessages(allMessages, count, chatId, this.nameCache)
+          throw new Error('message_history_page_limit')
         }
 
         // CHATONROOM represents entering a room and can advance unread state on
-        // the server. Use the login-time chat-list watermark for the read-only
-        // SYNCMSG fallback instead, and skip sync when the cursor is current.
-        const maxLogId = getLoginMaxLogId(loginResult, chatId)
-        if (!maxLogId || maxLogId.lessThanOrEqual(cur)) {
+        // the server. Reuse getMessagePage's read-only CHATINFO -> SYNCMSG path.
+        // A missing/stale login watermark proves neither emptiness nor currency.
+        const chatInfoResponse = await session.getChannelInfo(cid)
+        assertLocoOk(chatInfoResponse, 'CHATINFO')
+        const info = extractChannelInfo(chatInfoResponse.body as Record<string, unknown>, chatId)
+        if (readStateId(info.chatId) !== chatId || (info.left !== undefined && info.left !== false)) {
+          throw new Error('message_history_room_unavailable')
+        }
+        const latest = readStateId(info.lastLogId)
+        if (latest === null) throw new Error('message_history_watermark_unavailable')
+        const maxLogId = Long.fromString(latest, true)
+        if (maxLogId.lessThanOrEqual(cur.toUnsigned())) {
           return []
         }
 
         let reachedEnd = false
         for (let page = 0; page < MAX_PAGES; page++) {
           const response = await session.syncMessages(cid, 80, cur, maxLogId)
-          const batch = (response.body.chatLogs ?? []) as Array<Record<string, unknown>>
-          if (batch.length === 0) {
-            reachedEnd = true
-            break
-          }
+          assertLocoOk(response, 'SYNCMSG')
+          if (!Array.isArray(response.body.chatLogs)) throw new Error('message_history_invalid')
+          const batch = (response.body.chatLogs as Array<Record<string, unknown>>).filter(
+            (log) => longToString(log.chatId) === chatId,
+          )
+          if (batch.length === 0) throw new Error('message_history_unavailable')
 
           for (const log of batch) {
             const lid = longToString(log.logId)
@@ -1578,19 +1579,23 @@ export class KakaoTalkClient {
 
           const maxLog = findMaxLogId(batch, 'logId')
 
-          if (!maxLog || maxLog.equals(cur) || response.body.isOK) {
+          if (!maxLog || maxLog.toUnsigned().lessThanOrEqual(cur.toUnsigned())) {
+            throw new Error('message_history_stalled')
+          }
+          if (maxLog.toUnsigned().greaterThanOrEqual(maxLogId)) {
             reachedEnd = true
             break
           }
+          if (response.body.isOK === true) throw new Error('message_history_incomplete')
           cur = maxLog
         }
         if (!reachedEnd) {
-          warn(`[agent-kakaotalk] Warning: message fetch capped at ${MAX_PAGES} pages. Results may be incomplete.`)
+          throw new Error('message_history_page_limit')
         }
 
         return formatMessages(allMessages, count, chatId, this.nameCache)
       } catch (error) {
-        throw wrapError(error, 'get_messages_failed')
+        throw new KakaoTalkError('message_history_unavailable', 'get_messages_failed', { cause: error })
       }
     })
   }

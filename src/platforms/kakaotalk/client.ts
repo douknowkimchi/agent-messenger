@@ -457,9 +457,12 @@ function channelInfoToChatData(body: Record<string, unknown>, expectedChatId: st
 
 function extractChannelMaxLogId(body: Record<string, unknown>, expectedChatId: string): Long {
   const info = extractChannelInfo(body, expectedChatId)
-  const maxLogId = bsonToLong(info.lastLogId)
-  if (!maxLogId) throw new Error('CHATINFO response missing lastLogId')
-  return maxLogId
+  if (readStateId(info.chatId) !== expectedChatId || (info.left !== undefined && info.left !== false)) {
+    throw new Error('message_history_room_unavailable')
+  }
+  const latest = readStateId(info.lastLogId)
+  if (latest === null) throw new Error('message_history_watermark_unavailable')
+  return Long.fromString(latest, true)
 }
 
 interface OpenLinkInfoResponse {
@@ -854,7 +857,13 @@ function formatMessages(
   chatId: string,
   nameCache: MemberNameCache,
 ): KakaoMessage[] {
-  logs.sort((a, b) => (a.sendAt as number) - (b.sendAt as number))
+  // Select the suffix before projecting it. Wall-clock ties or reversals must
+  // not discard a newer native log that the caller can no longer recover.
+  logs.sort((left, right) => {
+    const a = BigInt(longToString(left.logId))
+    const b = BigInt(longToString(right.logId))
+    return a < b ? -1 : a > b ? 1 : 0
+  })
 
   return logs.slice(-count).map((log) => ({
     log_id: longToString(log.logId),
@@ -1469,7 +1478,7 @@ export class KakaoTalkClient {
         const chatInfoResponse = await session.getChannelInfo(parsedChatId)
         assertLocoOk(chatInfoResponse, 'CHATINFO')
         const maxLogId = extractChannelMaxLogId(chatInfoResponse.body as Record<string, unknown>, normalizedChatId)
-        if (maxLogId.lessThanOrEqual(cursor)) {
+        if (maxLogId.lessThanOrEqual(cursor.toUnsigned())) {
           return { messages: [], next_cursor: null, complete: true }
         }
 
@@ -1479,8 +1488,12 @@ export class KakaoTalkClient {
           (log) => longToString(log.chatId) === normalizedChatId,
         )
         const maxReturned = findMaxLogId(syncBatch, 'logId')
-        const protocolComplete =
-          syncResponse.body.isOK === true || (maxReturned !== null && maxReturned.greaterThanOrEqual(maxLogId))
+        const protocolComplete = maxReturned !== null && maxReturned.toUnsigned().greaterThanOrEqual(maxLogId)
+        // Match recent-history proof: an EOF flag cannot make an incomplete
+        // interval a terminal suffix for downstream readers and RAM caches.
+        if (!protocolComplete && syncResponse.body.isOK === true) {
+          throw new Error('message_history_incomplete')
+        }
 
         return buildMessagePage(syncBatch, count, cursor, protocolComplete, normalizedChatId, this.nameCache)
       } catch (error) {
@@ -1548,13 +1561,7 @@ export class KakaoTalkClient {
         // A missing/stale login watermark proves neither emptiness nor currency.
         const chatInfoResponse = await session.getChannelInfo(cid)
         assertLocoOk(chatInfoResponse, 'CHATINFO')
-        const info = extractChannelInfo(chatInfoResponse.body as Record<string, unknown>, chatId)
-        if (readStateId(info.chatId) !== chatId || (info.left !== undefined && info.left !== false)) {
-          throw new Error('message_history_room_unavailable')
-        }
-        const latest = readStateId(info.lastLogId)
-        if (latest === null) throw new Error('message_history_watermark_unavailable')
-        const maxLogId = Long.fromString(latest, true)
+        const maxLogId = extractChannelMaxLogId(chatInfoResponse.body as Record<string, unknown>, chatId)
         if (maxLogId.lessThanOrEqual(cur.toUnsigned())) {
           return []
         }

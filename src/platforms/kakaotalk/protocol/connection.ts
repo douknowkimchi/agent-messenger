@@ -4,12 +4,17 @@ import { connect as tlsConnect } from 'node:tls'
 import { debug } from '@/shared/utils/stderr'
 
 import { LocoCrypto } from './crypto'
+import type { HistoryAcceptanceGuard } from './history-acceptance'
 import { decodePacket, encodePacket } from './packet'
 import type { LocoPacket } from './types'
 
 const DEFAULT_SEND_TIMEOUT_MS = 15_000
 
 export class LocoConnection {
+  private readonly acceptanceAbort = () => this.close()
+  constructor(private readonly historyAcceptanceGuard?: HistoryAcceptanceGuard) {
+    historyAcceptanceGuard?.signal.addEventListener('abort', this.acceptanceAbort, { once: true })
+  }
   private socket: Socket | null = null
   private crypto: LocoCrypto | null = null
   private buffer = Buffer.alloc(0)
@@ -24,20 +29,22 @@ export class LocoConnection {
   private closeHandler: (() => void) | null = null
 
   async connectTls(host: string, port: number): Promise<void> {
+    this.historyAcceptanceGuard?.beforeConnect('tls')
     await new Promise<void>((resolve, reject) => {
       const socket = tlsConnect({ host, port, rejectUnauthorized: true }, () => resolve())
       this.socket = socket
-      socket.on('error', reject)
+      socket.on('error', (error: Error) => { this.historyAcceptanceGuard?.fail('CONNECTION_LOST'); reject(error) })
       socket.on('data', (data: Buffer) => this.onData(data))
       socket.on('close', () => this.handleClose())
     })
   }
 
   async connectSecure(host: string, port: number): Promise<void> {
+    this.historyAcceptanceGuard?.beforeConnect('secure')
     await new Promise<void>((resolve, reject) => {
       const socket = netConnect({ host, port }, () => resolve())
       this.socket = socket
-      socket.on('error', reject)
+      socket.on('error', (error: Error) => { this.historyAcceptanceGuard?.fail('CONNECTION_LOST'); reject(error) })
       socket.on('data', (data: Buffer) => this.onData(data))
       socket.on('close', () => this.handleClose())
     })
@@ -45,6 +52,7 @@ export class LocoConnection {
   }
 
   private async performHandshake(): Promise<void> {
+    this.historyAcceptanceGuard?.assertActive()
     this.crypto = new LocoCrypto()
     const handshakePacket = this.crypto.buildHandshakePacket()
     await this.write(handshakePacket)
@@ -56,12 +64,14 @@ export class LocoConnection {
   // the same encrypted channel (chunked into N frames automatically by the
   // crypto layer's 4-byte-size + nonce + ciphertext + tag wrapping).
   async writeRaw(data: Buffer): Promise<void> {
+    if (this.historyAcceptanceGuard) throw this.historyAcceptanceGuard.fail('SCOPE_REJECTED')
     if (!this.crypto) throw new Error('crypto not initialised')
     const encrypted = this.crypto.encrypt(data)
     await this.write(encrypted)
   }
 
   async sendPacket(method: string, body: Record<string, unknown> = {}): Promise<LocoPacket> {
+    this.historyAcceptanceGuard?.beforeSend(method, body)
     const packetId = ++this.packetIdCounter
     const packet: LocoPacket = {
       packetId,
@@ -74,7 +84,7 @@ export class LocoConnection {
     const raw = encodePacket(packet)
     const data = this.crypto ? this.crypto.encrypt(raw) : raw
 
-    return new Promise((resolve, reject) => {
+    const response = new Promise<LocoPacket>((resolve, reject) => {
       let entry: {
         resolve: (packet: LocoPacket) => void
         timer: ReturnType<typeof setTimeout>
@@ -83,6 +93,7 @@ export class LocoConnection {
         if (this.pendingResolvers.get(packetId) !== entry) return
         this.pendingResolvers.delete(packetId)
         this.timedOutIds.add(packetId)
+        this.historyAcceptanceGuard?.fail('DEADLINE')
         reject(new Error(`LOCO packet timeout: ${method} (${DEFAULT_SEND_TIMEOUT_MS}ms)`))
       }, DEFAULT_SEND_TIMEOUT_MS)
       entry = { resolve, timer }
@@ -93,8 +104,16 @@ export class LocoConnection {
         clearTimeout(entry.timer)
         this.pendingResolvers.delete(packetId)
         this.timedOutIds.add(packetId)
+        this.historyAcceptanceGuard?.fail('CONNECTION_LOST')
         reject(error)
       })
+    })
+    if (!this.historyAcceptanceGuard) return response
+    return response.then(packet => {
+      this.historyAcceptanceGuard!.response(method, packet)
+      return packet
+    }, error => {
+      throw this.historyAcceptanceGuard!.fail('CONNECTION_LOST')
     })
   }
 
@@ -107,6 +126,7 @@ export class LocoConnection {
   }
 
   close(): void {
+    this.historyAcceptanceGuard?.signal.removeEventListener('abort', this.acceptanceAbort)
     this.socket?.destroy()
     this.socket = null
     this.timedOutIds.clear()
@@ -178,6 +198,7 @@ export class LocoConnection {
   }
 
   private handleClose(): void {
+    if (this.pendingResolvers.size) this.historyAcceptanceGuard?.fail('CONNECTION_LOST')
     for (const entry of this.pendingResolvers.values()) {
       clearTimeout(entry.timer)
       entry.resolve({ packetId: 0, statusCode: -1, method: '', bodyType: 0, body: { error: 'connection closed' } })

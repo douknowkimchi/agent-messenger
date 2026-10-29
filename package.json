@@ -1,6 +1,6 @@
 {
   "name": "agent-messenger",
-  "version": "2.36.1-ser5.20",
+  "version": "2.36.1-ser5.21",
   "description": "Multi-platform messaging CLI for AI agents (Slack, Discord, Teams, Webex, Telegram, Telegram Bot, WhatsApp, LINE, iMessage, Instagram, KakaoTalk, Channel Talk)",
   "repository": {
     "type": "git",
@@ -162,8 +162,8 @@
     }
   },
   "scripts": {
-    "build": "tsc && tsc-alias --resolve-full-paths",
-    "postbuild": "bun scripts/postbuild.ts",
+    "build": "tsc",
+    "postbuild": "bun scripts/postbuild.ts && tsc-alias --resolve-full-paths",
     "test": "bun test src/",
     "test:e2e": "bun --config=bunfig.e2e.toml test",
     "typecheck": "tsc --noEmit",

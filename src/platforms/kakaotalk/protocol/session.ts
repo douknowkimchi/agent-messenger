@@ -15,6 +15,7 @@ import {
   getLocoDeviceConfig,
 } from './config'
 import { LocoConnection } from './connection'
+import type { HistoryAcceptanceGuard } from './history-acceptance'
 import { validateLoginListResponse } from './login-response'
 import type { BookingResponse, CheckinResponse, LoginListResponse, LocoPacket, SyncState } from './types'
 
@@ -66,6 +67,7 @@ export async function sendCreateDirectChatPacket(
 }
 
 export class LocoSession {
+  constructor(private readonly historyAcceptanceGuard?: HistoryAcceptanceGuard) {}
   private connection: LocoConnection | null = null
   private pingTimer: ReturnType<typeof setInterval> | null = null
   private pushHandler: ((packet: LocoPacket) => void) | null = null
@@ -84,14 +86,19 @@ export class LocoSession {
 
     const { host, port } = await this.bookAndCheckin(userId, deviceConfig)
 
-    this.connection = new LocoConnection()
+    this.connection = new LocoConnection(this.historyAcceptanceGuard)
     await this.connection.connectSecure(host, port)
 
     if (this.pushHandler) {
       this.connection.onPush(this.pushHandler)
     }
     if (this.closeHandler) {
-      this.connection.onClose(this.closeHandler)
+      this.connection.onClose(this.historyAcceptanceGuard ? () => {
+        // A finite probe must not leave the ping interval behind when the
+        // client invalidates its state after transport loss.
+        this.close()
+        this.closeHandler?.()
+      } : this.closeHandler)
     }
 
     const chatIds = syncState?.chatIds.map((id) => new Long(id.low, id.high)) ?? []
@@ -133,7 +140,7 @@ export class LocoSession {
     userId: string,
     deviceConfig: { os: string; appVersion: string; useSub: boolean },
   ): Promise<{ host: string; port: number }> {
-    const bookingConn = new LocoConnection()
+    const bookingConn = new LocoConnection(this.historyAcceptanceGuard)
     await bookingConn.connectTls(BOOKING_HOST, BOOKING_PORT)
 
     const bookingResponse = await bookingConn.sendPacket('GETCONF', {
@@ -148,7 +155,7 @@ export class LocoSession {
     const checkinHost = hosts?.[0] ?? CHECKIN_HOST
     const checkinPort = booking.wifi?.ports?.[0] ?? CHECKIN_PORT
 
-    const checkinConn = new LocoConnection()
+    const checkinConn = new LocoConnection(this.historyAcceptanceGuard)
     await checkinConn.connectSecure(checkinHost, checkinPort)
 
     const checkinResponse = await checkinConn.sendPacket('CHECKIN', {
@@ -267,12 +274,17 @@ export class LocoSession {
     return this.connection
   }
 
-  async syncMessages(chatId: Long, count = 20, cursor?: Long, maxLogId?: Long): Promise<LocoPacket> {
+  /**
+   * Synchronize (cursor, maxLogId] declaring how many logs are already held.
+   * heldCount is not a response limit; callers without that interval use zero.
+   * Even zero can acknowledge reading; it does not establish a read-only call.
+   */
+  async syncMessages(chatId: Long, heldCount = 0, cursor?: Long, maxLogId?: Long): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
     return this.connection.sendPacket('SYNCMSG', {
       chatId,
       cur: cursor ?? Long.fromNumber(0),
-      cnt: count,
+      cnt: heldCount,
       max: maxLogId ?? Long.fromNumber(0),
     })
   }

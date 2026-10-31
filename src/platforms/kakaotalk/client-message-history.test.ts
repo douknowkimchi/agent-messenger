@@ -52,7 +52,7 @@ describe('recent history proof', () => {
       const result = await (await client()).getMessages('100', { count: 2 })
       expect(result.map(value => value.log_id)).toEqual(['3'])
       expect(info).toHaveBeenCalledTimes(1)
-      expect(sync.mock.calls[0]?.map(value => String(value))).toEqual(['100', '80', '0', '3'])
+      expect(sync.mock.calls[0]?.map(value => String(value))).toEqual(['100', '0', '0', '3'])
       expect(login).toHaveBeenCalledTimes(1)
     })
   }
@@ -143,13 +143,15 @@ describe('recent history proof', () => {
     expect(sync).toHaveBeenCalledTimes(50)
   })
 
-  it('retains the existing single replacement when the session closes during history', async () => {
+  it('does not replay history when the acquired session closes', async () => {
     mchat.mockImplementationOnce(async () => {
       onClose?.()
       throw new Error('synthetic close')
     })
-    expect((await (await client()).getMessages('100')).map(value => value.log_id)).toEqual(['3'])
-    expect(login).toHaveBeenCalledTimes(2)
+    await expect((await client()).getMessages('100')).rejects.toMatchObject({ code: 'get_messages_failed' })
+    expect(login).toHaveBeenCalledTimes(1)
+    expect(info).not.toHaveBeenCalled()
+    expect(sync).not.toHaveBeenCalled()
   })
 })
 
@@ -190,8 +192,11 @@ describe('history selection and page truth', () => {
   for (const rows of [[], [log(2)], [log(1)], [log(3, 200)]]) {
     it(`rejects a terminal page before the fresh watermark (${rows.map(value => String(value.logId)).join(',') || 'empty'}, room=${rows[0]?.chatId ?? 'none'})`, async () => {
       sync.mockResolvedValueOnce(packet({ chatLogs: rows, isOK: true }))
+      // A row from another room fails whole-page admission before any cursor
+      // or completeness judgement, so its rejection keeps the admission code.
+      const code = rows[0]?.chatId === 200 ? 'message_history_invalid' : 'get_message_page_failed'
       await expect((await client()).getMessagePage('100', { from: '1', count: 2 }))
-        .rejects.toMatchObject({ code: 'get_message_page_failed' })
+        .rejects.toMatchObject({ code })
       expect(mchat).toHaveBeenCalledTimes(1)
       expect(info).toHaveBeenCalledTimes(1)
       expect(sync).toHaveBeenCalledTimes(1)
@@ -247,5 +252,206 @@ describe('history selection and page truth', () => {
     expect(page.messages.map(value => value.log_id)).toEqual(['2'])
     expect(page.next_cursor).toBe('2')
     expect(page.complete).toBe(false)
+  })
+})
+
+
+// Behavior port of KiwiTalk chat.rs apply_sync_page/update_forward and its
+// empty/overlap/terminal-gap/wrong-room tests. Rust persistence is not copied.
+// dlwltkd/kiwitalk@912528b6407a02a1f9b17cbc6fa3331497e6cabc, Apache-2.0.
+// See protocol/NOTICE.md for source, attribution and the deliberate differences.
+describe('donor incremental continuation', () => {
+  it('preserves a validated prefix and resumes after it when the next bulk page is empty', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [log(2), log(1)], eof: false }))
+      .mockResolvedValueOnce(packet({ chatLogs: [], eof: false }))
+    info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId: 4 } }))
+    sync.mockResolvedValueOnce(packet({ chatLogs: [log(3), log(4)], isOK: false }))
+    const values = await (await client()).getMessages('100', { count: 4 })
+    expect(values.map(value => value.log_id)).toEqual(['1', '2', '3', '4'])
+    expect(mchat.mock.calls.map(call => String(call[1][0]))).toEqual(['0', '2'])
+    expect(sync.mock.calls.map(call => call.map(value => String(value)))).toEqual([['100', '0', '2', '4']])
+  })
+
+  it('keeps the same prefix on the existing eligible same-session bulk failure path', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(2)], eof: false }))
+      .mockRejectedValueOnce(new Error('synthetic eligible bulk read failure'))
+    info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId: 4 } }))
+    sync.mockResolvedValueOnce(packet({ chatLogs: [log(3), log(4)], isOK: false }))
+    expect((await (await client()).getMessages('100', { count: 4 })).map(value => value.log_id))
+      .toEqual(['1', '2', '3', '4'])
+    expect(String(sync.mock.calls[0]?.[2])).toBe('2')
+    expect(login).toHaveBeenCalledTimes(1)
+  })
+
+  it('requires a fresh same-room target before calling an empty tail complete', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(2)], eof: false }))
+      .mockResolvedValueOnce(packet({ chatLogs: [], eof: true }))
+    info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId: 2 } }))
+    expect((await (await client()).getMessages('100', { count: 2 })).map(value => value.log_id))
+      .toEqual(['1', '2'])
+    expect(info).toHaveBeenCalledTimes(1)
+    expect(sync).not.toHaveBeenCalled()
+  })
+
+  for (const body of [
+    { chatInfo: { chatId: 200, lastLogId: 2 } },
+    { chatInfo: { chatId: 100, lastLogId: 2, left: true } },
+  ]) {
+    it(`does not publish the preserved prefix when target identity is invalid: ${JSON.stringify(body)}`, async () => {
+      mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(2)], eof: false }))
+        .mockResolvedValueOnce(packet({ chatLogs: [], eof: true }))
+      info.mockResolvedValueOnce(packet(body))
+      await expect((await client()).getMessages('100', { count: 2 }))
+        .rejects.toMatchObject({ code: 'get_messages_failed' })
+      expect(sync).not.toHaveBeenCalled()
+    })
+  }
+
+  it('retains failure instead of returning an old prefix when the remaining interval is unavailable', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(2)], eof: false }))
+      .mockResolvedValueOnce(packet({ chatLogs: [], eof: false }))
+    info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId: 4 } }))
+    sync.mockResolvedValueOnce(packet({ chatLogs: null, isOK: true }))
+    await expect((await client()).getMessages('100', { count: 4 }))
+      .rejects.toMatchObject({ code: 'get_messages_failed' })
+    expect(String(sync.mock.calls[0]?.[2])).toBe('2')
+    expect(sync).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves native order, overlap deduplication and exact large cursor across the handoff', async () => {
+    const a = '9007199254740993', b = '9007199254740994', c = '9007199254740995'
+    const row = (id: string) => ({ ...log(1), logId: Long.fromString(id), message: `synthetic-${id}` })
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [row(b), row(a), row(b)], eof: false }))
+      .mockRejectedValueOnce(new Error('synthetic eligible bulk read failure'))
+    info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId: Long.fromString(c) } }))
+    sync.mockResolvedValueOnce(packet({ chatLogs: [row(c), row(b)], isOK: false }))
+    const values = await (await client()).getMessages('100', { count: 3 })
+    expect(values.map(value => value.log_id)).toEqual([a, b, c])
+    expect(values.map(value => value.message)).toEqual([a, b, c].map(id => `synthetic-${id}`))
+    expect(String(sync.mock.calls[0]?.[2])).toBe(b)
+  })
+
+  it('does not turn a non-progressing bulk page into permission for another protocol read', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(2)], eof: false }))
+      .mockResolvedValueOnce(packet({ chatLogs: [log(2), log(1)], eof: false }))
+    await expect((await client()).getMessages('100', { count: 3 }))
+      .rejects.toMatchObject({ code: 'get_messages_failed' })
+    expect(info).not.toHaveBeenCalled()
+    expect(sync).not.toHaveBeenCalled()
+  })
+
+  it('rejects a foreign-room bulk record before it can move or confirm the cursor', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(3, 200)], eof: true }))
+    await expect((await client()).getMessages('100', { count: 3 }))
+      .rejects.toMatchObject({ code: 'get_messages_failed' })
+    expect(info).not.toHaveBeenCalled()
+    expect(sync).not.toHaveBeenCalled()
+  })
+
+  it('does not hide an explicit provider denial with a history fallback', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(2)], eof: false }))
+      .mockResolvedValueOnce({ statusCode: 0, body: { status: -401 } })
+    await expect((await client()).getMessages('100', { count: 3 }))
+      .rejects.toMatchObject({ code: 'get_messages_failed' })
+    expect(info).not.toHaveBeenCalled()
+    expect(sync).not.toHaveBeenCalled()
+  })
+
+  it('preserves the existing bulk page cap without resetting progress or falling through', async () => {
+    let page = 0
+    mchat.mockImplementation(async () => packet({ chatLogs: [log(++page)], eof: false }))
+    await expect((await client()).getMessages('100', { count: 2 }))
+      .rejects.toMatchObject({ code: 'get_messages_failed' })
+    expect(mchat).toHaveBeenCalledTimes(50)
+    expect(info).not.toHaveBeenCalled()
+    expect(sync).not.toHaveBeenCalled()
+  })
+
+  it('does not complete preserved content when the fresh target regresses below that content', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(2)], eof: false }))
+      .mockResolvedValueOnce(packet({ chatLogs: [], eof: true }))
+    info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId: 1 } }))
+    await expect((await client()).getMessages('100', { count: 2 }))
+      .rejects.toMatchObject({ code: 'get_messages_failed' })
+    expect(sync).not.toHaveBeenCalled()
+  })
+})
+
+// The fixed KiwiTalk Android response contract accepts an omitted/null collection.
+// Reuse its empty-page rule: retain progress; empty alone is never completion.
+describe('donor empty collection compatibility', () => {
+  const shapes: Array<[string, Record<string, unknown>]> = [
+    ['omitted', { eof: true }],
+    ['null', { chatLogs: null, eof: true }],
+    ['array', { chatLogs: [], eof: true }],
+  ]
+  for (const [name, body] of shapes) {
+    it(`accepts ${name} bulk empty only after a fresh zero target`, async () => {
+      mchat.mockResolvedValueOnce(packet(body))
+      info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId: 0 } }))
+      expect(await (await client()).getMessages('100')).toEqual([])
+      expect(mchat).toHaveBeenCalledTimes(1)
+      expect(info).toHaveBeenCalledTimes(1)
+      expect(sync).not.toHaveBeenCalled()
+    })
+
+    it(`retains the valid prefix across a ${name} bulk tail and retrieves only the missing suffix`, async () => {
+      mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(2)], eof: false }))
+        .mockResolvedValueOnce(packet(body))
+      info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId: 4 } }))
+      sync.mockResolvedValueOnce(packet({ chatLogs: [log(3), log(4)], isOK: false }))
+      expect((await (await client()).getMessages('100', { count: 4 })).map(m => m.log_id))
+        .toEqual(['1', '2', '3', '4'])
+      expect(sync.mock.calls.map(call => call.map(value => String(value))))
+        .toEqual([['100', '0', '2', '4']])
+    })
+
+    it(`does not re-fetch a current prefix after a ${name} bulk tail`, async () => {
+      mchat.mockResolvedValueOnce(packet({ chatLogs: [log(1), log(2)], eof: false }))
+        .mockResolvedValueOnce(packet(body))
+      info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId: 2 } }))
+      expect((await (await client()).getMessages('100', { count: 2 })).map(m => m.log_id))
+        .toEqual(['1', '2'])
+      expect(info).toHaveBeenCalledTimes(1)
+      expect(sync).not.toHaveBeenCalled()
+    })
+  }
+
+  for (const value of [{}, 42, '']) {
+    it(`still rejects non-null malformed bulk collection ${JSON.stringify(value)}`, async () => {
+      mchat.mockResolvedValueOnce(packet({ chatLogs: value, eof: true }))
+      await expect((await client()).getMessages('100'))
+        .rejects.toMatchObject({ code: 'get_messages_failed' })
+      expect(info).not.toHaveBeenCalled()
+      expect(sync).not.toHaveBeenCalled()
+    })
+  }
+  for (const body of [{ status: -401, eof: true }, { status: -401, chatLogs: null, eof: true }]) {
+    it(`does not normalize a provider refusal into an empty room: ${JSON.stringify(body)}`, async () => {
+      mchat.mockResolvedValueOnce({ statusCode: 0, body })
+      await expect((await client()).getMessages('100'))
+        .rejects.toMatchObject({ code: 'get_messages_failed' })
+      expect(info).not.toHaveBeenCalled()
+      expect(sync).not.toHaveBeenCalled()
+    })
+  }
+})
+
+// KiwiTalk whole-page admission applies across requests too: no accepted cursor
+// can be derived from a valid prefix followed by a foreign/invalid record.
+describe('resumable forward page admission', () => {
+  for (const fallback of [false, true]) {
+    for (const bad of [ { ...log(4), chatId: Long.fromNumber(999) },
+      { ...log(4), logId: Number.MAX_SAFE_INTEGER + 1 } ]) {
+      it(`rejects whole ${fallback ? 'sync' : 'bulk'} page before checkpoint`, async () => {
+        if (fallback) sync.mockResolvedValueOnce(packet({ chatLogs: [log(2), bad], isOK: false }))
+        else mchat.mockResolvedValueOnce(packet({ chatLogs: [log(2), bad], eof: false }))
+        await expect((await client()).getMessagePage('100', { from: '1', count: 2 })).rejects.toThrow()
+      })
+    }
+  }
+  it('rejects a SYNC record beyond its fresh target', async () => {
+    sync.mockResolvedValueOnce(packet({ chatLogs: [log(2), log(4)], isOK: false }))
+    await expect((await client()).getMessagePage('100', { from: '1', count: 2 })).rejects.toThrow()
   })
 })

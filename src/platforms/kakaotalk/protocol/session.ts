@@ -267,12 +267,17 @@ export class LocoSession {
     return this.connection
   }
 
-  async syncMessages(chatId: Long, count = 20, cursor?: Long, maxLogId?: Long): Promise<LocoPacket> {
+  /**
+   * Synchronize (cursor, maxLogId] declaring how many logs are already held.
+   * heldCount is not a response limit; callers without that interval use zero.
+   * Even zero can acknowledge reading; it does not establish a read-only call.
+   */
+  async syncMessages(chatId: Long, heldCount = 0, cursor?: Long, maxLogId?: Long): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
     return this.connection.sendPacket('SYNCMSG', {
       chatId,
       cur: cursor ?? Long.fromNumber(0),
-      cnt: count,
+      cnt: heldCount,
       max: maxLogId ?? Long.fromNumber(0),
     })
   }

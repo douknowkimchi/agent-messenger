@@ -91,14 +91,12 @@ Deliberate differences: accepted progress lasts only for the current SDK call
 in RAM; no SQLite, disk checkpoint, cross-call cache, new login, room entry,
 GETMSGS recovery, or native read acknowledgement was imported. Existing eligible
 same-session MCHATLOGS-to-SYNCMSG fallback and existing page budgets are retained.
-SYNCMSG keeps the production SDK18 request count (`min(count, 80)` for the
-forward page, 80 for the recent reader; the donor's Android probe sends 50), and
-the forward page ends at `isOK` as the donor's `sync_chat_stream` does: on the
-real provider every startup interval answered `isOK` before CHATINFO's
-lastLogId, so 2.36.1-ser5.22's zero count and target-required forward
-completion rejected all of them. The external held-count reading of `cnt`
-remains unverified on this account. The recent reader keeps its stricter suffix
-proof.
+The forward page ends at `isOK`, as the donor's `sync_chat_stream` and the
+production SDK18 reader do: on the real provider every startup interval answered
+`isOK` before CHATINFO's lastLogId, so 2.36.1-ser5.22's target-required forward
+completion rejected all of them. The held count stays zero (the donor's Android
+probe sends 50; the held-count reading of `cnt` remains an external observation,
+unverified on this account). The recent reader keeps its stricter suffix proof.
 Explicit provider denial, invalid page and no-progress errors stop instead of
 being recast as permission to try another protocol. An empty bulk tail requires
 the existing fresh CHATINFO target check before its retained prefix can be

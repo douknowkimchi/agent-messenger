@@ -373,7 +373,7 @@ function historyFixture() {
 
 for (const kind of ['recent', 'page'] as const) {
   for (const count of [1, 20, 100]) {
-    test(`history repair ${kind} return count ${count} sends the production SYNCMSG count`, async () => {
+    test(`history repair ${kind} return count ${count} never becomes held-count`, async () => {
       const f = historyFixture()
       try {
         const rows = Array.from({ length: 105 }, (_, n) => f.row(11 + n))
@@ -384,9 +384,7 @@ for (const kind of ['recent', 'page'] as const) {
         assert.equal(messages.length, count)
         assert.equal(messages[0]!.log_id, String(kind === 'recent' ? 116 - count : 11))
         assert.equal(messages.at(-1)!.log_id, String(kind === 'recent' ? 115 : 10 + count))
-        // SDK18's request values: the page reader asks min(count, 80), the recent reader 80.
-        const cnt = String(kind === 'recent' ? 80 : Math.min(count, 80))
-        assert.deepEqual(f.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [['100', cnt, '10', '115']])
+        assert.deepEqual(f.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [['100', '0', '10', '115']])
         assert.equal(f.acquisitions(), 1)
       } finally { f.client.close() }
     })
@@ -523,7 +521,7 @@ test('history repair normal forward pagination remains one operation on one sess
     const value = await f.run('recent')
     assert.deepEqual((value as Array<{ log_id: string }>).map(m => m.log_id), ['11', '12', '13'])
     assert.deepEqual(f.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [
-      ['100', '80', '10', '13'], ['100', '80', '11', '13'], ['100', '80', '12', '13'],
+      ['100', '0', '10', '13'], ['100', '0', '11', '13'], ['100', '0', '12', '13'],
     ])
     assert.equal(f.acquisitions(), 1)
     assert.equal(f.calls.some(c => c.replacement), false)
@@ -546,7 +544,7 @@ for (const rows of [[], [11], [11, 12]]) {
       assert.deepEqual(result.messages.map(m => m.log_id), rows.map(String))
       assert.equal(result.complete, true)
       assert.deepEqual(page.calls.map(c => c.method), ['MCHATLOGS', 'CHATINFO', 'SYNCMSG'])
-      assert.deepEqual(page.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [['100', '20', '10', '13']])
+      assert.deepEqual(page.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [['100', '0', '10', '13']])
       assert.equal(page.acquisitions(), 1)
     } finally { page.client.close() }
 

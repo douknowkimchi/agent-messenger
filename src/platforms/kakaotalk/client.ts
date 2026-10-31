@@ -1504,7 +1504,7 @@ export class KakaoTalkClient {
         return { messages: [], next_cursor: null, complete: true }
       }
 
-      const syncResponse = await session.syncMessages(parsedChatId, Math.min(count, 80), cursor, maxLogId)
+      const syncResponse = await session.syncMessages(parsedChatId, 0, cursor, maxLogId)
       this.assertHistorySession(session)
       assertLocoOk(syncResponse, 'SYNCMSG')
       if (syncResponse.body.chatLogs != null && !Array.isArray(syncResponse.body.chatLogs)) {
@@ -1518,9 +1518,10 @@ export class KakaoTalkClient {
       const maxReturned = findMaxLogId(syncBatch, 'logId')
       // Forward page contract of the production SDK18 reader and KiwiTalk's
       // sync_chat_stream: isOK ends the interval. On the real provider every
-      // startup interval answered isOK before CHATINFO's lastLogId, so
-      // requiring that target here rejected all of them. The recent reader
-      // keeps its stricter suffix proof.
+      // startup interval answered isOK before CHATINFO's lastLogId (request
+      // b8c1e9f7, 55 rooms), so requiring that target here rejected all of
+      // them. The held count stays zero; the recent reader keeps its stricter
+      // suffix proof.
       const protocolComplete =
         syncResponse.body.isOK === true ||
         (maxReturned !== null && maxReturned.toUnsigned().greaterThanOrEqual(maxLogId))
@@ -1596,10 +1597,9 @@ export class KakaoTalkClient {
       }
 
       // CHATONROOM represents entering a room and can advance unread state on
-      // the server. Use CHATINFO for a fresh target, then SYNCMSG with the
-      // production SDK18 request count for the missing interval. SYNCMSG is
-      // not proof of no read side effects, so this operation must never be
-      // replayed.
+      // the server. Use CHATINFO for a fresh target, then SYNCMSG with zero
+      // held logs for the missing interval. Even cnt=0 is not proof of no
+      // read side effects, so this operation must never be replayed.
       // A missing/stale login watermark proves neither emptiness nor currency.
       const chatInfoResponse = await session.getChannelInfo(cid)
       this.assertHistorySession(session)
@@ -1614,7 +1614,7 @@ export class KakaoTalkClient {
 
       let reachedEnd = false
       for (let page = 0; page < MAX_PAGES; page++) {
-        const response = await session.syncMessages(cid, 80, cur, maxLogId)
+        const response = await session.syncMessages(cid, 0, cur, maxLogId)
         this.assertHistorySession(session)
         assertLocoOk(response, 'SYNCMSG')
         const batch = validatedHistoryRows(response.body.chatLogs ?? [], chatId)

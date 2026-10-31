@@ -52,7 +52,7 @@ describe('recent history proof', () => {
       const result = await (await client()).getMessages('100', { count: 2 })
       expect(result.map(value => value.log_id)).toEqual(['3'])
       expect(info).toHaveBeenCalledTimes(1)
-      expect(sync.mock.calls[0]?.map(value => String(value))).toEqual(['100', '80', '0', '3'])
+      expect(sync.mock.calls[0]?.map(value => String(value))).toEqual(['100', '0', '0', '3'])
       expect(login).toHaveBeenCalledTimes(1)
     })
   }
@@ -197,7 +197,7 @@ describe('history selection and page truth', () => {
       const page = await (await client()).getMessagePage('100', { from: '1', count: 2 })
       expect(page.messages.map(value => value.log_id)).toEqual([...expected])
       expect(page.complete).toBe(true)
-      expect(sync.mock.calls.map(call => call.map(value => String(value)))).toEqual([['100', '2', '1', '3']])
+      expect(sync.mock.calls.map(call => call.map(value => String(value)))).toEqual([['100', '0', '1', '3']])
       expect(mchat).toHaveBeenCalledTimes(1)
       expect(info).toHaveBeenCalledTimes(1)
       expect(login).toHaveBeenCalledTimes(1)
@@ -279,7 +279,7 @@ describe('donor incremental continuation', () => {
     const values = await (await client()).getMessages('100', { count: 4 })
     expect(values.map(value => value.log_id)).toEqual(['1', '2', '3', '4'])
     expect(mchat.mock.calls.map(call => String(call[1][0]))).toEqual(['0', '2'])
-    expect(sync.mock.calls.map(call => call.map(value => String(value)))).toEqual([['100', '80', '2', '4']])
+    expect(sync.mock.calls.map(call => call.map(value => String(value)))).toEqual([['100', '0', '2', '4']])
   })
 
   it('keeps the same prefix on the existing eligible same-session bulk failure path', async () => {
@@ -413,7 +413,7 @@ describe('donor empty collection compatibility', () => {
       expect((await (await client()).getMessages('100', { count: 4 })).map(m => m.log_id))
         .toEqual(['1', '2', '3', '4'])
       expect(sync.mock.calls.map(call => call.map(value => String(value))))
-        .toEqual([['100', '80', '2', '4']])
+        .toEqual([['100', '0', '2', '4']])
     })
 
     it(`does not re-fetch a current prefix after a ${name} bulk tail`, async () => {

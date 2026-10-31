@@ -268,16 +268,19 @@ export class LocoSession {
   }
 
   /**
-   * Synchronize (cursor, maxLogId] declaring how many logs are already held.
-   * heldCount is not a response limit; callers without that interval use zero.
-   * Even zero can acknowledge reading; it does not establish a read-only call.
+   * Synchronize (cursor, maxLogId]. The readers keep the request values the
+   * production SDK18 contract sends; KiwiTalk's Android probe sends 50. An
+   * external observation reads `cnt` as a held count; that reading is not
+   * verified on this account. With cnt=0 every real startup interval answered
+   * isOK before the CHATINFO target. The call is not proven read-only and must
+   * never be replayed.
    */
-  async syncMessages(chatId: Long, heldCount = 0, cursor?: Long, maxLogId?: Long): Promise<LocoPacket> {
+  async syncMessages(chatId: Long, count = 20, cursor?: Long, maxLogId?: Long): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
     return this.connection.sendPacket('SYNCMSG', {
       chatId,
       cur: cursor ?? Long.fromNumber(0),
-      cnt: heldCount,
+      cnt: count,
       max: maxLogId ?? Long.fromNumber(0),
     })
   }

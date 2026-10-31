@@ -373,7 +373,7 @@ function historyFixture() {
 
 for (const kind of ['recent', 'page'] as const) {
   for (const count of [1, 20, 100]) {
-    test(`history repair ${kind} return count ${count} never becomes held-count`, async () => {
+    test(`history repair ${kind} return count ${count} sends the production SYNCMSG count`, async () => {
       const f = historyFixture()
       try {
         const rows = Array.from({ length: 105 }, (_, n) => f.row(11 + n))
@@ -384,7 +384,9 @@ for (const kind of ['recent', 'page'] as const) {
         assert.equal(messages.length, count)
         assert.equal(messages[0]!.log_id, String(kind === 'recent' ? 116 - count : 11))
         assert.equal(messages.at(-1)!.log_id, String(kind === 'recent' ? 115 : 10 + count))
-        assert.deepEqual(f.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [['100', '0', '10', '115']])
+        // SDK18's request values: the page reader asks min(count, 80), the recent reader 80.
+        const cnt = String(kind === 'recent' ? 80 : Math.min(count, 80))
+        assert.deepEqual(f.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [['100', cnt, '10', '115']])
         assert.equal(f.acquisitions(), 1)
       } finally { f.client.close() }
     })
@@ -392,19 +394,21 @@ for (const kind of ['recent', 'page'] as const) {
 
   for (const shape of ['missing', 'null', 'array'] as const) {
     for (const isOK of [false, true]) {
-      test(`history repair ${kind} successful ${shape} isOK=${isOK} stays unmet`, async () => {
+      test(`history repair ${kind} successful ${shape} isOK=${isOK} ${kind === 'page' && isOK ? 'ends the forward interval' : 'stays unmet'}`, async () => {
         const f = historyFixture()
         try {
           f.setSync(async () => packet({ status: 0, isOK, ...(shape === 'missing' ? {} : { chatLogs: shape === 'null' ? null : [] }) }))
-          if (kind === 'recent' || isOK) {
+          if (kind === 'recent') {
             await assert.rejects(f.run(kind), (e: unknown) => {
               const error = e as Error & { code: string; cause: Error }
-              assert.equal(error.code, kind === 'recent' ? 'get_messages_failed' : 'get_message_page_failed')
-              assert.equal(error.cause.message, kind === 'recent' ? 'message_history_unavailable' : 'message_history_incomplete')
+              assert.equal(error.code, 'get_messages_failed')
+              assert.equal(error.cause.message, 'message_history_unavailable')
               return true
             })
           } else {
-            assert.deepEqual(await f.run(kind), { messages: [], next_cursor: null, complete: false })
+            // The forward page follows SDK18/KiwiTalk: isOK ends the interval
+            // even before CHATINFO's lastLogId; without isOK it stays open.
+            assert.deepEqual(await f.run(kind), { messages: [], next_cursor: null, complete: isOK })
           }
           assert.equal(f.calls.filter(c => c.method === 'SYNCMSG').length, 1)
         } finally { f.client.close() }
@@ -519,9 +523,43 @@ test('history repair normal forward pagination remains one operation on one sess
     const value = await f.run('recent')
     assert.deepEqual((value as Array<{ log_id: string }>).map(m => m.log_id), ['11', '12', '13'])
     assert.deepEqual(f.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [
-      ['100', '0', '10', '13'], ['100', '0', '11', '13'], ['100', '0', '12', '13'],
+      ['100', '80', '10', '13'], ['100', '80', '11', '13'], ['100', '80', '12', '13'],
     ])
     assert.equal(f.acquisitions(), 1)
     assert.equal(f.calls.some(c => c.replacement), false)
   } finally { f.client.close() }
 })
+
+// The real provider shape that rejected every SDK22 startup reconciliation
+// read (STARTUP:sdk:message_history_incomplete x55): an empty MCHATLOGS from the
+// persisted cursor, a CHATINFO lastLogId beyond it, and a SYNCMSG that ends the
+// interval with isOK before that target. The forward page returns what was
+// sent and ends; the recent reader still refuses to call it a current suffix.
+for (const rows of [[], [11], [11, 12]]) {
+  test(`forward page accepts isOK before the CHATINFO target with ${rows.length} record(s); recent stays strict`, async () => {
+    const page = historyFixture()
+    try {
+      page.setSync(async () => packet({ status: 0, chatLogs: rows.map(id => page.row(id)), isOK: true }))
+      const value = await page.run('page')
+      assert.equal(Array.isArray(value), false)
+      const result = value as { messages: Array<{ log_id: string }>; complete: boolean }
+      assert.deepEqual(result.messages.map(m => m.log_id), rows.map(String))
+      assert.equal(result.complete, true)
+      assert.deepEqual(page.calls.map(c => c.method), ['MCHATLOGS', 'CHATINFO', 'SYNCMSG'])
+      assert.deepEqual(page.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [['100', '20', '10', '13']])
+      assert.equal(page.acquisitions(), 1)
+    } finally { page.client.close() }
+
+    const recent = historyFixture()
+    try {
+      recent.setSync(async () => packet({ status: 0, chatLogs: rows.map(id => recent.row(id)), isOK: true }))
+      await assert.rejects(recent.run('recent'), (e: unknown) => {
+        const error = e as Error & { code: string; cause: Error }
+        assert.equal(error.code, 'get_messages_failed')
+        assert.equal(error.cause.message, rows.length === 0 ? 'message_history_unavailable' : 'message_history_incomplete')
+        return true
+      })
+      assert.equal(recent.calls.filter(c => c.method === 'SYNCMSG').length, 1)
+    } finally { recent.client.close() }
+  })
+}

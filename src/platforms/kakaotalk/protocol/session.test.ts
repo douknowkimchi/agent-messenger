@@ -167,20 +167,20 @@ describe('explicit participant entry wire', () => {
   })
 })
 
-describe('SYNCMSG held-count wire contract', () => {
-  for (const heldCount of [undefined, 0, 1, 20, 100]) {
-    it(`declares held count ${heldCount ?? 'default zero'} independently of the response limit`, async () => {
+describe('SYNCMSG count wire contract', () => {
+  for (const count of [undefined, 1, 20, 80]) {
+    it(`sends cnt ${count ?? 'default 20'} as Int32 with exact cursors`, async () => {
       const { connection, sent } = fakeConnection({ statusCode: 0, body: { status: 0 } })
       const cid = Long.fromString('9007199254740993')
       const cursor = Long.fromString('9007199254740994')
       const target = Long.fromString('9007199254741000')
-      await LocoSession.prototype.syncMessages.call({ connection } as unknown as LocoSession, cid, heldCount, cursor, target)
+      await LocoSession.prototype.syncMessages.call({ connection } as unknown as LocoSession, cid, count, cursor, target)
       expect(sent).toHaveLength(1)
       expect(sent[0]!.method).toBe('SYNCMSG')
       const body = deserialize(serialize(sent[0]!.body), { promoteValues: false })
       expect(Object.keys(body).sort()).toEqual(['chatId', 'cnt', 'cur', 'max'])
       expect(body.cnt._bsontype).toBe('Int32')
-      expect(Number(body.cnt)).toBe(heldCount ?? 0)
+      expect(Number(body.cnt)).toBe(count ?? 20)
       expect(body.chatId.toString()).toBe(cid.toString())
       expect(body.cur.toString()).toBe(cursor.toString())
       expect(body.max.toString()).toBe(target.toString())

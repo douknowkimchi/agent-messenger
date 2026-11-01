@@ -91,6 +91,19 @@ export interface KakaoTalkMemberEntryFailure {
   containsSelf: boolean | null
 }
 
+/**
+ * What an explicit entry that stopped after CHATONROOM had already read: the
+ * room's whole ID list and the MEMBER rows received so far. The visible part
+ * is counts only; the IDs and rows stay inside this client. It continues once,
+ * on the same session, and only while CHATINFO still shows the same count and
+ * displayed members.
+ */
+export interface KakaoMemberEntryProgress {
+  readonly chat_id: string
+  readonly active_members: number
+  readonly received: number
+}
+
 export class KakaoTalkError extends Error {
   code: string
   readonly serverStatus?: number
@@ -99,6 +112,8 @@ export class KakaoTalkError extends Error {
   readonly getChatFailureReason?: KakaoTalkGetChatFailureReason
   readonly memberSnapshotFailure?: Readonly<KakaoTalkMemberSnapshotFailure>
   readonly memberEntryFailure?: Readonly<KakaoTalkMemberEntryFailure>
+  /** Set only on an explicit entry failure that kept its ID list and session. */
+  memberEntryProgress?: KakaoMemberEntryProgress
 
   constructor(
     message: string,
@@ -144,6 +159,17 @@ class LocoResponseError extends Error {
 }
 
 type ChatData = Record<string, unknown>
+
+// The ID list and rows of an entry that stopped after CHATONROOM; bound to
+// the session state it was read on.
+interface MemberEntryProgressState {
+  state: SessionState
+  chatId: string
+  activeMembers: number
+  displayIds: Set<string>
+  ids: string[]
+  rows: Map<string, Record<string, unknown>>
+}
 
 interface SessionState {
   session: LocoSession
@@ -959,6 +985,8 @@ export class KakaoTalkClient {
   private pushHandlers = new Set<KakaoPushHandler>()
   private sessionEventHandlers = new Set<KakaoSessionEventHandler>()
   private nameCache = new MemberNameCache()
+  // Entry progress handed out by failed entries; each continues at most once.
+  private memberEntryProgress = new WeakMap<KakaoMemberEntryProgress, MemberEntryProgressState>()
 
   private readonly connectionAdmission: KakaoConnectionAdmission | undefined
   private admissionSequence = 0
@@ -1700,8 +1728,15 @@ export class KakaoTalkClient {
     })
   }
 
-  /** Explicit entry on the current session only: no reconnect, replay or login. */
-  async enterRoomMemberSnapshot(chatId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoMemberSnapshot> {
+  /**
+   * Explicit entry on the current session only: no reconnect, replay or login.
+   * Given the progress of an earlier failed entry, it sends no CHATONROOM and
+   * asks MEMBER only for the IDs not received yet; the progress is used up.
+   */
+  async enterRoomMemberSnapshot(
+    chatId: string,
+    options: { signal?: AbortSignal; progress?: KakaoMemberEntryProgress } = {},
+  ): Promise<KakaoMemberSnapshot> {
     const cid = parseChatId(chatId)
     const normalizedChatId = longToString(cid)
     const state = this.state
@@ -1713,78 +1748,35 @@ export class KakaoTalkClient {
     }
     check()
     const session = state!.session
+    let resumed: MemberEntryProgressState | undefined
+    if (options.progress !== undefined) {
+      resumed = this.memberEntryProgress.get(options.progress)
+      this.memberEntryProgress.delete(options.progress)
+      if (!resumed || resumed.state !== state || resumed.chatId !== normalizedChatId) {
+        throw new KakaoTalkError('member_entry_progress_invalid', 'get_member_snapshot_failed')
+      }
+    }
+    // Set once the whole ID list is known (or given back); kept on failure
+    // while it still holds, so a passing CHATINFO failure loses nothing.
+    let progress: MemberEntryProgressState | undefined = resumed
     try {
       const before = await session.getChannelInfo(cid)
       check()
       assertLocoOk(before, 'CHATINFO')
       const first = channelMemberView(before.body as Record<string, unknown>, normalizedChatId)
       if (first.activeMembers < 1 || first.activeMembers > 5000) throw new Error('member_entry_count_invalid')
-      const entry = await session.enterRoom(cid)
-      check()
-      assertLocoOk(entry, 'CHATONROOM')
-      if (longToString(entry.body.c) !== normalizedChatId) throw new Error('member_entry_chat_mismatch')
       let members: ReturnType<typeof exactMemberRecords>
-      // CHATONROOM can return full records even above 100 active members.
-      // Accept that unambiguous wire shape; the exact identities and the
-      // second CHATINFO count/consistency checks still apply below.
-      if (first.activeMembers <= 100 || (entry.body.mi === undefined && Array.isArray(entry.body.m))) {
-        if (entry.body.mi !== undefined) throw new Error('member_entry_shape_invalid')
-        members = exactMemberRecords(entry.body.m, 'CHATONROOM')
+      if (resumed) {
+        // The room must still look as it did when its ID list was read.
+        if (first.activeMembers !== resumed.activeMembers || !sameIds(first.ids, resumed.displayIds)) {
+          progress = undefined
+          throw new Error('member_entry_progress_stale')
+        }
+        members = await this.readMemberEntryBatches(session, cid, normalizedChatId, resumed, check)
       } else {
-        const idsFailure = (validatedIdCount: number | null = null, containsSelf: boolean | null = null) => {
-          const kind = (value: unknown): KakaoTalkMemberEntryFailure['idsKind'] =>
-            value === undefined ? 'absent' : value === null ? 'null' : Array.isArray(value) ? 'array' : 'other'
-          return new KakaoTalkError('member_entry_ids_invalid', 'get_member_snapshot_failed', {
-            memberEntryFailure: Object.freeze({
-              activeCount: first.activeMembers,
-              idsKind: kind(entry.body.mi),
-              idCount: Array.isArray(entry.body.mi) ? entry.body.mi.length : null,
-              recordsKind: kind(entry.body.m),
-              recordCount: Array.isArray(entry.body.m) ? entry.body.m.length : null,
-              validatedIdCount,
-              containsSelf,
-            }),
-          })
-        }
-        if (
-          !Array.isArray(entry.body.mi) ||
-          entry.body.m !== undefined ||
-          entry.body.mi.length < first.activeMembers - 1 ||
-          entry.body.mi.length > first.activeMembers
-        ) {
-          throw idsFailure()
-        }
-        const requested = exactMemberRecords(
-          entry.body.mi.map((userId: unknown) => ({ userId })),
-          'CHATONROOM',
-        )
-        // node-kakao's normal-channel data owner fills the authenticated self
-        // when CHATONROOM mi omits it. Only that known identity may fill the
-        // one missing slot; MEMBER must still return its actual record.
-        const selfUserId = longToString(parseUserId(this.userId ?? ''))
-        if (requested.ids.size === first.activeMembers - 1 && !requested.ids.has(selfUserId)) {
-          requested.ids.add(selfUserId)
-        }
-        if (requested.ids.size !== first.activeMembers || !requested.ids.has(selfUserId)) {
-          throw idsFailure(requested.ids.size, requested.ids.has(selfUserId))
-        }
-        const rows: Array<Record<string, unknown>> = []
-        const ids = [...requested.ids]
-        for (let offset = 0; offset < ids.length; offset += 100) {
-          check()
-          const batch = ids.slice(offset, offset + 100)
-          const response = await session.getMembersByIds(cid, batch.map(parseUserId))
-          check()
-          assertLocoOk(response, 'MEMBER')
-          if (response.body.chatId !== undefined && longToString(response.body.chatId) !== normalizedChatId) {
-            throw new Error('member_entry_member_chat_mismatch')
-          }
-          const exact = exactMemberRecords(response.body.members, 'MEMBER')
-          if (!sameIds(new Set(batch), exact.ids)) throw new Error('member_entry_batch_incomplete')
-          rows.push(...exact.records)
-        }
-        members = exactMemberRecords(rows, 'MEMBER')
-        if (!sameIds(requested.ids, members.ids)) throw new Error('member_entry_incomplete')
+        members = await this.enterAndReadMembers(session, cid, normalizedChatId, first, state!, check, (value) => {
+          progress = value
+        })
       }
       const after = await session.getChannelInfo(cid)
       check()
@@ -1796,6 +1788,8 @@ export class KakaoTalkClient {
         !sameIds(first.ids, second.ids) ||
         !subsetIds(second.ids, members.ids)
       ) {
+        // The room changed under the list: nothing read so far can continue.
+        progress = undefined
         throw new Error('member_entry_changed_or_incomplete')
       }
       return {
@@ -1806,8 +1800,132 @@ export class KakaoTalkClient {
         consistency_basis: 'entered_chatinfo_member',
       }
     } catch (error) {
-      throw wrapError(error, 'get_member_snapshot_failed')
+      const failure = wrapError(error, 'get_member_snapshot_failed')
+      if (progress && progress.state === this.state && !this.closed && progress.rows.size < progress.ids.length) {
+        const handle: KakaoMemberEntryProgress = Object.freeze({
+          chat_id: normalizedChatId,
+          active_members: progress.activeMembers,
+          received: progress.rows.size,
+        })
+        this.memberEntryProgress.set(handle, progress)
+        failure.memberEntryProgress = handle
+      }
+      throw failure
     }
+  }
+
+  /**
+   * The members a stopped entry already received, in its ID-list order, for
+   * display only. Reading them does not use the progress up; a used-up,
+   * foreign or closed-session progress has none.
+   */
+  memberEntryProgressMembers(progress: KakaoMemberEntryProgress): KakaoMember[] {
+    const kept = this.memberEntryProgress.get(progress)
+    if (!kept || kept.state !== this.state || this.closed) return []
+    return kept.ids.flatMap((id) => {
+      const record = kept.rows.get(id)
+      return record ? [formatMember(record)] : []
+    })
+  }
+
+  private async enterAndReadMembers(
+    session: SessionState['session'],
+    cid: Long,
+    normalizedChatId: string,
+    first: ReturnType<typeof channelMemberView>,
+    state: SessionState,
+    check: () => void,
+    keep: (progress: MemberEntryProgressState) => void,
+  ): Promise<ReturnType<typeof exactMemberRecords>> {
+    const entry = await session.enterRoom(cid)
+    check()
+    assertLocoOk(entry, 'CHATONROOM')
+    if (longToString(entry.body.c) !== normalizedChatId) throw new Error('member_entry_chat_mismatch')
+    // CHATONROOM can return full records even above 100 active members.
+    // Accept that unambiguous wire shape; the exact identities and the
+    // second CHATINFO count/consistency checks still apply below.
+    if (first.activeMembers <= 100 || (entry.body.mi === undefined && Array.isArray(entry.body.m))) {
+      if (entry.body.mi !== undefined) throw new Error('member_entry_shape_invalid')
+      return exactMemberRecords(entry.body.m, 'CHATONROOM')
+    }
+    const idsFailure = (validatedIdCount: number | null = null, containsSelf: boolean | null = null) => {
+      const kind = (value: unknown): KakaoTalkMemberEntryFailure['idsKind'] =>
+        value === undefined ? 'absent' : value === null ? 'null' : Array.isArray(value) ? 'array' : 'other'
+      return new KakaoTalkError('member_entry_ids_invalid', 'get_member_snapshot_failed', {
+        memberEntryFailure: Object.freeze({
+          activeCount: first.activeMembers,
+          idsKind: kind(entry.body.mi),
+          idCount: Array.isArray(entry.body.mi) ? entry.body.mi.length : null,
+          recordsKind: kind(entry.body.m),
+          recordCount: Array.isArray(entry.body.m) ? entry.body.m.length : null,
+          validatedIdCount,
+          containsSelf,
+        }),
+      })
+    }
+    if (
+      !Array.isArray(entry.body.mi) ||
+      entry.body.m !== undefined ||
+      entry.body.mi.length < first.activeMembers - 1 ||
+      entry.body.mi.length > first.activeMembers
+    ) {
+      throw idsFailure()
+    }
+    const requested = exactMemberRecords(
+      entry.body.mi.map((userId: unknown) => ({ userId })),
+      'CHATONROOM',
+    )
+    // node-kakao's normal-channel data owner fills the authenticated self
+    // when CHATONROOM mi omits it. Only that known identity may fill the
+    // one missing slot; MEMBER must still return its actual record.
+    const selfUserId = longToString(parseUserId(this.userId ?? ''))
+    if (requested.ids.size === first.activeMembers - 1 && !requested.ids.has(selfUserId)) {
+      requested.ids.add(selfUserId)
+    }
+    if (requested.ids.size !== first.activeMembers || !requested.ids.has(selfUserId)) {
+      throw idsFailure(requested.ids.size, requested.ids.has(selfUserId))
+    }
+    const progress: MemberEntryProgressState = {
+      state,
+      chatId: normalizedChatId,
+      activeMembers: first.activeMembers,
+      displayIds: first.ids,
+      ids: [...requested.ids],
+      rows: new Map(),
+    }
+    keep(progress)
+    return this.readMemberEntryBatches(session, cid, normalizedChatId, progress, check)
+  }
+
+  // MEMBER for the IDs without a row yet, 100 at a time in ID-list order. A
+  // batch counts only when it returns exactly the IDs it asked for.
+  private async readMemberEntryBatches(
+    session: SessionState['session'],
+    cid: Long,
+    normalizedChatId: string,
+    progress: MemberEntryProgressState,
+    check: () => void,
+  ): Promise<ReturnType<typeof exactMemberRecords>> {
+    const missing = progress.ids.filter((id) => !progress.rows.has(id))
+    for (let offset = 0; offset < missing.length; offset += 100) {
+      check()
+      const batch = missing.slice(offset, offset + 100)
+      const response = await session.getMembersByIds(cid, batch.map(parseUserId))
+      check()
+      assertLocoOk(response, 'MEMBER')
+      if (response.body.chatId !== undefined && longToString(response.body.chatId) !== normalizedChatId) {
+        throw new Error('member_entry_member_chat_mismatch')
+      }
+      const exact = exactMemberRecords(response.body.members, 'MEMBER')
+      if (!sameIds(new Set(batch), exact.ids)) throw new Error('member_entry_batch_incomplete')
+      for (const record of exact.records) progress.rows.set(memberIdKey(record)!, record)
+    }
+    const members = exactMemberRecords(
+      progress.ids.map((id) => progress.rows.get(id)),
+      'MEMBER',
+    )
+    if (!sameIds(new Set(progress.ids), members.ids)) throw new Error('member_entry_incomplete')
+    return members
   }
 
   async getMembers(chatId: string): Promise<KakaoMember[]> {

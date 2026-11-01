@@ -3111,6 +3111,207 @@ describe('KakaoTalkClient', () => {
       expect(mockEnterRoom).not.toHaveBeenCalled()
       expect(mockLogin).toHaveBeenCalledTimes(1)
     })
+
+    describe('continuing a stopped entry', () => {
+      const rows = Array.from({ length: 1117 }, (_, i) => member(i + 1))
+      const display = rows.slice(0, 5)
+      function requested(call: number): string[] {
+        return mockGetMembersByIds.mock.calls[call][1].map((id: Long) => id.toString())
+      }
+      function answerBatches(failAt: number | null) {
+        let calls = 0
+        mockGetMembersByIds.mockImplementation(async (_chat, ids) => {
+          calls += 1
+          if (calls === failAt) return { statusCode: -999, body: {} }
+          return {
+            statusCode: 0,
+            body: {
+              chatId: makeLong(100),
+              members: rows.filter((m) => ids.some((id: Long) => id.toString() === String(m.userId.low))),
+            },
+          }
+        })
+      }
+      async function stopped(client: KakaoTalkClient, failAt = 8) {
+        mockGetChannelInfo.mockResolvedValue(memberChannelInfo(1117, display))
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi: rows.map((m) => m.userId) } })
+        answerBatches(failAt)
+        let caught: unknown
+        try {
+          await client.enterRoomMemberSnapshot('100')
+        } catch (error) {
+          caught = error
+        }
+        expect(caught).toBeInstanceOf(KakaoTalkError)
+        return caught as KakaoTalkError
+      }
+
+      it('keeps the 700 rows read before the eighth batch failed and asks only for the other 417', async () => {
+        const client = await connected()
+        const failure = await stopped(client)
+        expect(failure.message).toBe('MEMBER failed: statusCode=-999')
+        expect(failure.memberEntryProgress).toEqual({ chat_id: '100', active_members: 1117, received: 700 })
+        expect(Object.isFrozen(failure.memberEntryProgress)).toBe(true)
+        expect(JSON.stringify(failure.memberEntryProgress)).not.toContain('Member')
+        expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(8)
+        const firstSeven = Array.from({ length: 7 }, (_, i) => requested(i)).flat()
+
+        answerBatches(null)
+        const result = await client.enterRoomMemberSnapshot('100', { progress: failure.memberEntryProgress })
+        expect(result.complete).toBe(true)
+        expect(result.consistency_basis).toBe('entered_chatinfo_member')
+        expect(result.members).toHaveLength(1117)
+        expect(new Set(result.members.map((m) => m.user_id)).size).toBe(1117)
+        // No second CHATONROOM; 417 IDs in five batches, none of the first 700.
+        expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(13)
+        const continued = Array.from({ length: 5 }, (_, i) => requested(8 + i))
+        expect(continued.map((batch) => batch.length)).toEqual([100, 100, 100, 100, 17])
+        expect(continued.flat().filter((id) => firstSeven.includes(id))).toHaveLength(0)
+        expect(new Set([...firstSeven, ...continued.flat()]).size).toBe(1117)
+        expect(mockGetChannelInfo).toHaveBeenCalledTimes(3)
+        expect(mockGetAllMembers).not.toHaveBeenCalled()
+        expect(mockMarkRead).not.toHaveBeenCalled()
+        expect(mockLogin).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+
+      it('shows the received members of a progress without using it up', async () => {
+        const client = await connected()
+        const failure = await stopped(client)
+        const shown = client.memberEntryProgressMembers(failure.memberEntryProgress!)
+        expect(shown).toHaveLength(700)
+        expect(shown.slice(0, 2).map((m) => [m.user_id, m.nickname])).toEqual([['1', 'Member 1'], ['2', 'Member 2']])
+        expect(client.memberEntryProgressMembers({ chat_id: '100', active_members: 1117, received: 700 })).toEqual([])
+        answerBatches(null)
+        expect((await client.enterRoomMemberSnapshot('100', { progress: failure.memberEntryProgress })).members).toHaveLength(1117)
+        expect(client.memberEntryProgressMembers(failure.memberEntryProgress!)).toEqual([])
+        client.close()
+      })
+
+      it('continues a progress at most once and only for its own room', async () => {
+        const client = await connected()
+        const failure = await stopped(client)
+        const progress = failure.memberEntryProgress!
+        await expect(client.enterRoomMemberSnapshot('200', { progress })).rejects.toThrow('member_entry_progress_invalid')
+        // Refused for the other room, the progress is gone for this one too.
+        await expect(client.enterRoomMemberSnapshot('100', { progress })).rejects.toThrow('member_entry_progress_invalid')
+        await expect(
+          client.enterRoomMemberSnapshot('100', { progress: { chat_id: '100', active_members: 1117, received: 700 } }),
+        ).rejects.toThrow('member_entry_progress_invalid')
+        expect(mockGetChannelInfo).toHaveBeenCalledTimes(1)
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(8)
+        expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+
+      it('drops the progress when the count or the displayed members changed, before any MEMBER', async () => {
+        for (const changed of [memberChannelInfo(1118, display), memberChannelInfo(1117, rows.slice(1, 6))]) {
+          mockGetChannelInfo.mockReset()
+          mockGetMembersByIds.mockReset()
+          mockEnterRoom.mockReset()
+          const client = await connected()
+          const failure = await stopped(client)
+          mockGetChannelInfo.mockResolvedValue(changed)
+          answerBatches(null)
+          let caught: unknown
+          try {
+            await client.enterRoomMemberSnapshot('100', { progress: failure.memberEntryProgress })
+          } catch (error) {
+            caught = error
+          }
+          expect((caught as KakaoTalkError).message).toBe('member_entry_progress_stale')
+          expect((caught as KakaoTalkError).memberEntryProgress).toBeUndefined()
+          expect(mockGetMembersByIds).toHaveBeenCalledTimes(8)
+          expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+          client.close()
+        }
+      })
+
+      it('keeps the rows of a continuation that failed again and hands out a new progress', async () => {
+        const client = await connected()
+        const failure = await stopped(client)
+        answerBatches(2)
+        let caught: unknown
+        try {
+          await client.enterRoomMemberSnapshot('100', { progress: failure.memberEntryProgress })
+        } catch (error) {
+          caught = error
+        }
+        const again = caught as KakaoTalkError
+        expect(again.memberEntryProgress).toEqual({ chat_id: '100', active_members: 1117, received: 800 })
+        answerBatches(null)
+        expect((await client.enterRoomMemberSnapshot('100', { progress: again.memberEntryProgress })).members).toHaveLength(1117)
+        expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+        // 317 left after 800 rows: 100, 100, 100 and 17.
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(8 + 2 + 4)
+        client.close()
+      })
+
+      it('keeps the progress when the continuation stops at its first CHATINFO', async () => {
+        const client = await connected()
+        const failure = await stopped(client)
+        mockGetChannelInfo.mockResolvedValueOnce({ statusCode: -500, body: {} })
+        let caught: unknown
+        try {
+          await client.enterRoomMemberSnapshot('100', { progress: failure.memberEntryProgress })
+        } catch (error) {
+          caught = error
+        }
+        const again = caught as KakaoTalkError
+        expect(again.memberEntryProgress).toEqual({ chat_id: '100', active_members: 1117, received: 700 })
+        answerBatches(null)
+        expect((await client.enterRoomMemberSnapshot('100', { progress: again.memberEntryProgress })).members).toHaveLength(1117)
+        expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(8 + 5)
+        client.close()
+      })
+
+      it('hands out no progress when the room changed after every row arrived', async () => {
+        const client = await connected()
+        let reads = 0
+        mockGetChannelInfo.mockImplementation(async () => memberChannelInfo(++reads === 1 ? 1117 : 1116, display))
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi: rows.map((m) => m.userId) } })
+        answerBatches(null)
+        let caught: unknown
+        try {
+          await client.enterRoomMemberSnapshot('100')
+        } catch (error) {
+          caught = error
+        }
+        expect((caught as KakaoTalkError).message).toBe('member_entry_changed_or_incomplete')
+        expect((caught as KakaoTalkError).memberEntryProgress).toBeUndefined()
+        client.close()
+      })
+
+      it('keeps the progress of an aborted entry but not of a closed session', async () => {
+        const client = await connected()
+        mockGetChannelInfo.mockResolvedValue(memberChannelInfo(1117, display))
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi: rows.map((m) => m.userId) } })
+        const controller = new AbortController()
+        let calls = 0
+        mockGetMembersByIds.mockImplementation(async (_chat, ids) => {
+          if (++calls === 3) controller.abort()
+          return {
+            statusCode: 0,
+            body: { chatId: makeLong(100), members: rows.filter((m) => ids.some((id: Long) => id.toString() === String(m.userId.low))) },
+          }
+        })
+        let caught: unknown
+        try {
+          await client.enterRoomMemberSnapshot('100', { signal: controller.signal })
+        } catch (error) {
+          caught = error
+        }
+        // The third answer came after the abort: it is not counted.
+        expect((caught as KakaoTalkError).memberEntryProgress).toEqual({ chat_id: '100', active_members: 1117, received: 200 })
+        const progress = (caught as KakaoTalkError).memberEntryProgress
+        client.close()
+        await expect(client.enterRoomMemberSnapshot('100', { progress })).rejects.toThrow()
+        expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      })
+    })
   })
 
   describe('getMembers / getMembersByIds', () => {

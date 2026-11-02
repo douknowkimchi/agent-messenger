@@ -3139,6 +3139,103 @@ describe('KakaoTalkClient', () => {
       expect(mockGetMembersByIds).toHaveBeenCalledTimes(12)
       client.close()
     })
+    describe('open-chat entry answered with records and the self record (olu)', () => {
+      const base = 2n ** 53n
+      const big = (i: number) => {
+        const n = base + BigInt(i)
+        return { low: Number(n & 0xffffffffn), high: Number(n >> 32n) }
+      }
+      const others = Array.from({ length: 1116 }, (_, i) => ({ userId: big(i + 2), nickName: `Open ${i + 2}` }))
+      const self = { userId: big(1), nickName: 'Open self' }
+      async function openClient() {
+        const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: (base + 1n).toString() })
+        await client.getChats({ resolveTitles: false })
+        mockGetChannelInfo.mockResolvedValue(memberChannelInfo(1117, others))
+        return client
+      }
+      it('takes the 1116 listed members plus olu as the whole 1117 roster without MEMBER', async () => {
+        const client = await openClient()
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: others, olu: self } })
+        const snapshot = await client.enterRoomMemberSnapshot('100')
+        expect(snapshot.complete).toBe(true)
+        expect(snapshot.members).toHaveLength(1117)
+        expect(snapshot.members.some((m) => m.user_id === (base + 1n).toString())).toBe(true)
+        expect(mockGetMembersByIds).not.toHaveBeenCalled()
+        expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+      it('still refuses a capped list and names its counts, shape and olu use', async () => {
+        const client = await openClient()
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: others.slice(0, 1000), olu: self } })
+        let caught: unknown
+        try {
+          await client.enterRoomMemberSnapshot('100')
+        } catch (error) {
+          caught = error
+        }
+        const error = caught as KakaoTalkError
+        expect(error.message).toBe('member_entry_changed_or_incomplete')
+        expect(error.memberEntryConsistency).toEqual({
+          entryShape: 'records', firstActive: 1117, secondActive: 1117, recordCount: 1001,
+          firstDisplayCount: 1116, secondDisplayCount: 1116, displayIdsStable: true, displayContainedCount: 1000,
+          openSelfRecord: 'added', accountInRecords: true,
+        })
+        expect(Object.isFrozen(error.memberEntryConsistency)).toBe(true)
+        expect(JSON.stringify(error.memberEntryConsistency)).not.toContain('Open')
+        client.close()
+      })
+      it('never adds an olu that is not this account, so a missing member is never covered by it', async () => {
+        // Reviewer case: the account and A listed, B missing, olu carrying another (open) ID.
+        const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: '1' })
+        await client.getChats({ resolveTitles: false })
+        const member = (id: number) => ({ userId: makeLong(id), nickName: `M ${id}` })
+        mockGetChannelInfo.mockResolvedValue(memberChannelInfo(3, [member(2)]))
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [member(1), member(2)], olu: member(9) } })
+        let caught: unknown
+        try {
+          await client.enterRoomMemberSnapshot('100')
+        } catch (error) {
+          caught = error
+        }
+        const error = caught as KakaoTalkError
+        expect(error.message).toBe('member_entry_changed_or_incomplete')
+        expect(error.memberEntryConsistency).toMatchObject({ recordCount: 2, openSelfRecord: 'foreign', accountInRecords: true })
+        // A foreign olu already listed in m is reported as foreign, not as this account's record.
+        mockGetChannelInfo.mockResolvedValue(memberChannelInfo(3, [member(2)]))
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [member(2), member(9)], olu: member(9) } })
+        caught = undefined
+        try {
+          await client.enterRoomMemberSnapshot('100')
+        } catch (failure) {
+          caught = failure
+        }
+        expect((caught as KakaoTalkError).memberEntryConsistency).toMatchObject({ recordCount: 2, openSelfRecord: 'foreign', accountInRecords: false })
+        // And without the account in m, a foreign olu does not stand in for it either.
+        mockGetChannelInfo.mockResolvedValue(memberChannelInfo(3, [member(2)]))
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [member(2), member(3)], olu: member(9) } })
+        caught = undefined
+        try {
+          await client.enterRoomMemberSnapshot('100')
+        } catch (failure) {
+          caught = failure
+        }
+        expect((caught as KakaoTalkError).memberEntryConsistency).toMatchObject({ recordCount: 2, openSelfRecord: 'foreign', accountInRecords: false })
+        client.close()
+      })
+      it('does not add olu twice and reports it as already present', async () => {
+        const client = await openClient()
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [self, ...others.slice(0, 1000)], olu: self } })
+        let caught: unknown
+        try {
+          await client.enterRoomMemberSnapshot('100')
+        } catch (error) {
+          caught = error
+        }
+        const error = caught as KakaoTalkError
+        expect(error.memberEntryConsistency).toMatchObject({ recordCount: 1001, openSelfRecord: 'present', accountInRecords: true })
+        client.close()
+      })
+    })
     it('names a GETMEM record refusal and keeps it on getMembers', async () => {
       const client = await connected()
       mockGetChannelInfo.mockResolvedValue(memberChannelInfo(2, [member(1)]))

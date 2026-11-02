@@ -116,6 +116,25 @@ export interface KakaoTalkMemberRecordFailure {
 }
 
 /**
+ * Why an explicit entry's list did not hold against the second CHATINFO:
+ * counts, the CHATONROOM answer shape and how the open-chat self record
+ * (`olu`) was used. No identities.
+ */
+export interface KakaoTalkMemberEntryConsistency {
+  entryShape: 'records' | 'ids' | 'resumed'
+  firstActive: number
+  secondActive: number
+  recordCount: number
+  firstDisplayCount: number
+  secondDisplayCount: number
+  displayIdsStable: boolean
+  displayContainedCount: number
+  /** absent: no olu; added: olu (this account) filled its missing slot; present: already listed; foreign: another ID, never added. */
+  openSelfRecord: 'absent' | 'added' | 'present' | 'foreign'
+  accountInRecords: boolean
+}
+
+/**
  * What an explicit entry that stopped after CHATONROOM had already read: the
  * room's whole ID list and the MEMBER rows received so far. The visible part
  * is counts only; the IDs and rows stay inside this client. It continues once,
@@ -137,6 +156,7 @@ export class KakaoTalkError extends Error {
   readonly memberSnapshotFailure?: Readonly<KakaoTalkMemberSnapshotFailure>
   readonly memberEntryFailure?: Readonly<KakaoTalkMemberEntryFailure>
   readonly memberRecordFailure?: Readonly<KakaoTalkMemberRecordFailure>
+  readonly memberEntryConsistency?: Readonly<KakaoTalkMemberEntryConsistency>
   /** Set only on an explicit entry failure that kept its ID list and session. */
   memberEntryProgress?: KakaoMemberEntryProgress
 
@@ -152,6 +172,7 @@ export class KakaoTalkError extends Error {
       memberSnapshotFailure?: Readonly<KakaoTalkMemberSnapshotFailure>
       memberEntryFailure?: Readonly<KakaoTalkMemberEntryFailure>
       memberRecordFailure?: Readonly<KakaoTalkMemberRecordFailure>
+      memberEntryConsistency?: Readonly<KakaoTalkMemberEntryConsistency>
     },
   ) {
     super(message, options)
@@ -164,6 +185,7 @@ export class KakaoTalkError extends Error {
     this.memberSnapshotFailure = options?.memberSnapshotFailure
     this.memberEntryFailure = options?.memberEntryFailure
     this.memberRecordFailure = options?.memberRecordFailure
+    this.memberEntryConsistency = options?.memberEntryConsistency
   }
 }
 
@@ -174,6 +196,13 @@ class MemberRecordError extends Error {
     readonly memberRecordFailure: Readonly<KakaoTalkMemberRecordFailure>,
   ) {
     super(message)
+  }
+}
+
+/** An explicit entry whose list did not hold, with its aggregate shape. */
+class MemberEntryConsistencyError extends Error {
+  constructor(readonly memberEntryConsistency: Readonly<KakaoTalkMemberEntryConsistency>) {
+    super('member_entry_changed_or_incomplete')
   }
 }
 
@@ -615,12 +644,14 @@ function wrapError(
       memberSnapshotFailure: error.memberSnapshotFailure,
       memberEntryFailure: error.memberEntryFailure,
       memberRecordFailure: error.memberRecordFailure,
+      memberEntryConsistency: error.memberEntryConsistency,
     })
   }
   const message = error instanceof Error ? error.message : String(error)
   return new KakaoTalkError(message, code, {
     cause: error,
     memberRecordFailure: error instanceof MemberRecordError ? error.memberRecordFailure : undefined,
+    memberEntryConsistency: error instanceof MemberEntryConsistencyError ? error.memberEntryConsistency : undefined,
     serverStatus: error instanceof LocoResponseError ? error.serverStatus : undefined,
     responseStatusSource: error instanceof LocoResponseError ? error.responseStatusSource : undefined,
     responseFailureKind:
@@ -1852,6 +1883,8 @@ export class KakaoTalkClient {
     // Set once the whole ID list is known (or given back); kept on failure
     // while it still holds, so a passing CHATINFO failure loses nothing.
     let progress: MemberEntryProgressState | undefined = resumed
+    const entryInfo: { shape: KakaoTalkMemberEntryConsistency['entryShape'];
+      openSelf: KakaoTalkMemberEntryConsistency['openSelfRecord'] } = { shape: resumed ? 'resumed' : 'ids', openSelf: 'absent' }
     try {
       const before = await session.getChannelInfo(cid)
       check()
@@ -1869,7 +1902,7 @@ export class KakaoTalkClient {
       } else {
         members = await this.enterAndReadMembers(session, cid, normalizedChatId, first, state!, check, (value) => {
           progress = value
-        })
+        }, entryInfo)
       }
       const after = await session.getChannelInfo(cid)
       check()
@@ -1883,7 +1916,19 @@ export class KakaoTalkClient {
       ) {
         // The room changed under the list: nothing read so far can continue.
         progress = undefined
-        throw new Error('member_entry_changed_or_incomplete')
+        const account = this.userId ? longToString(parseUserId(this.userId)) : null
+        throw new MemberEntryConsistencyError(Object.freeze({
+          entryShape: entryInfo.shape,
+          firstActive: first.activeMembers,
+          secondActive: second.activeMembers,
+          recordCount: members.records.length,
+          firstDisplayCount: first.ids.size,
+          secondDisplayCount: second.ids.size,
+          displayIdsStable: sameIds(first.ids, second.ids),
+          displayContainedCount: [...second.ids].filter((id) => members.ids.has(id)).length,
+          openSelfRecord: entryInfo.openSelf,
+          accountInRecords: account !== null && members.ids.has(account),
+        }))
       }
       return {
         chat_id: normalizedChatId,
@@ -1929,6 +1974,8 @@ export class KakaoTalkClient {
     state: SessionState,
     check: () => void,
     keep: (progress: MemberEntryProgressState) => void,
+    entryInfo: { shape: KakaoTalkMemberEntryConsistency['entryShape'];
+      openSelf: KakaoTalkMemberEntryConsistency['openSelfRecord'] },
   ): Promise<ReturnType<typeof exactMemberRecords>> {
     const entry = await session.enterRoom(cid)
     check()
@@ -1939,7 +1986,28 @@ export class KakaoTalkClient {
     // second CHATINFO count/consistency checks still apply below.
     if (first.activeMembers <= 100 || (entry.body.mi === undefined && Array.isArray(entry.body.m))) {
       if (entry.body.mi !== undefined) throw new Error('member_entry_shape_invalid')
-      return exactMemberRecords(entry.body.m, 'CHATONROOM')
+      entryInfo.shape = 'records'
+      const listed = exactMemberRecords(entry.body.m, 'CHATONROOM')
+      // An open chat answers the signed-in member's own open-link record as
+      // `olu` beside `m` (node-kakao TalkOpenChannelDataSession.chatON adds it
+      // to the user list after `m`). It may only fill the signed-in account's
+      // own missing slot: its ID must be this account's and absent from `m`.
+      // Any other ID would count someone twice or someone unknown, so it is
+      // never added. Every count check still holds.
+      const olu = entry.body.olu
+      if (olu && typeof olu === 'object' && !Array.isArray(olu)) {
+        const id = memberIdKey(olu as Record<string, unknown>)
+        const account = this.userId ? longToString(parseUserId(this.userId)) : null
+        if (id && id === account && listed.ids.has(id)) {
+          entryInfo.openSelf = 'present'
+        } else if (id && id === account) {
+          entryInfo.openSelf = 'added'
+          return exactMemberRecords([...(entry.body.m as unknown[]), olu], 'CHATONROOM')
+        } else if (id) {
+          entryInfo.openSelf = 'foreign'
+        }
+      }
+      return listed
     }
     const idsFailure = (validatedIdCount: number | null = null, containsSelf: boolean | null = null) => {
       const kind = (value: unknown): KakaoTalkMemberEntryFailure['idsKind'] =>

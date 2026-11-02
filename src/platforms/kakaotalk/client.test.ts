@@ -3228,6 +3228,19 @@ describe('KakaoTalkClient', () => {
         expect((caught as KakaoTalkError).memberEntryConsistency).toMatchObject({ recordCount: 2, openSelfRecord: 'foreign', accountInRecords: false })
         client.close()
       })
+      it('keeps the CHATINFO name of the account when its olu carries no string name', async () => {
+        // Reviewer case: olu without nn (or with a non-string nn) must not blank the account's listed name.
+        for (const nameless of [{ userId: makeLong(1), lmt: 2 }, { userId: makeLong(1), nn: 7, lmt: 2 }]) {
+          const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: '1' })
+          await client.getChats({ resolveTitles: false })
+          mockGetChannelInfo.mockResolvedValue(memberChannelInfo(2, [{ userId: makeLong(1), nickName: '내 이름' }]))
+          mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [{ userId: makeLong(2), nickName: '상대' }], olu: nameless } })
+          const snapshot = await client.enterRoomMemberSnapshot('100')
+          expect(snapshot.members).toHaveLength(2)
+          expect(snapshot.members.find((m) => m.user_id === '1')).toMatchObject({ nickname: '내 이름', open_permission: 2 })
+          client.close()
+        }
+      })
       it('does not add olu twice and reports it as already present', async () => {
         const client = await openClient()
         mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [self, ...others.slice(0, 1000)], olu } })

@@ -960,9 +960,17 @@ function memberRecordError(
 // `olu` is Kakao's OpenLinkChannelUserStruct, not an `m` record: its name is
 // `nn` and its permission `lmt` (node-kakao structToOpenLinkChannelUserInfo).
 // Read as the open member (OpenMemberStruct) it stands for, so the account's
-// row keeps its name, photos, open token, profile link and permission.
+// row keeps its name, photos, open token, profile link and permission. Only
+// fields olu actually carries are set (a name only as a string): an entry row
+// wins over CHATINFO's when the two are merged, and an absent olu field must
+// leave CHATINFO's value in place.
 function openLinkUserAsMember(olu: Record<string, unknown>): Record<string, unknown> {
-  return { userId: olu.userId, nickName: olu.nn, pi: olu.pi, fpi: olu.fpi, opi: olu.opi, opt: olu.opt, pli: olu.pli, mt: olu.lmt }
+  const member: Record<string, unknown> = { userId: olu.userId }
+  if (typeof olu.nn === 'string') member.nickName = olu.nn
+  for (const [from, to] of [['pi', 'pi'], ['fpi', 'fpi'], ['opi', 'opi'], ['opt', 'opt'], ['pli', 'pli'], ['lmt', 'mt']]) {
+    if (olu[from] !== undefined) member[to] = olu[from]
+  }
+  return member
 }
 
 function exactMemberRecords(

@@ -65,6 +65,21 @@ export async function sendCreateDirectChatPacket(
   return connection.sendPacket(CREATE_DIRECT_CHAT_METHOD, buildCreateDirectChatBody(peerId))
 }
 
+// JOINLINK into one open link with the profile the account joins with.
+// Wire shape from node-kakao 8512e469 (MIT, storycraft)
+// TalkOpenChannelSession.joinChannel and OpenLinkProfile.serializeLinkProfile:
+// `{ li, ref: 'EW:', ptp }` plus `pli` for an open profile (ptp 16); the main
+// profile is `{ ptp: 1 }`. The anonymous profile (ptp 2, nn, pp path) and the
+// passcode token are not built here. This helper only owns the packet; the
+// public client method dispatches it at most once.
+export const JOIN_OPEN_LINK_METHOD = 'JOINLINK'
+
+export type OpenJoinProfileWire = { ptp: 1 } | { ptp: 16; pli: Long }
+
+export function buildJoinOpenLinkBody(linkId: Long, profile: OpenJoinProfileWire): Record<string, unknown> {
+  return { li: linkId, ref: 'EW:', ...profile }
+}
+
 export class LocoSession {
   private connection: LocoConnection | null = null
   private pingTimer: ReturnType<typeof setInterval> | null = null
@@ -184,6 +199,11 @@ export class LocoSession {
   async createDirectChat(peerId: Long): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
     return sendCreateDirectChatPacket(this.connection, peerId)
+  }
+
+  async joinOpenLink(linkId: Long, profile: OpenJoinProfileWire): Promise<LocoPacket> {
+    if (!this.connection) throw new Error('Not connected')
+    return this.connection.sendPacket(JOIN_OPEN_LINK_METHOD, buildJoinOpenLinkBody(linkId, profile))
   }
 
   // Quoted reply — a WRITE with message_type 26 (REPLY) whose `extra` JSON

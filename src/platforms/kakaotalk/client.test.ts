@@ -18,6 +18,7 @@ const mockSyncMessages = mock(() => Promise.resolve({}))
 const mockSendMessage = mock(() => Promise.resolve({}))
 const mockSendReply = mock(() => Promise.resolve({}))
 const mockCreateDirectChat = mock(() => Promise.resolve({}))
+const mockJoinOpenLink = mock(() => Promise.resolve({}))
 const mockMarkRead = mock(() => Promise.resolve({}))
 const mockLeaveChat = mock(() => Promise.resolve({}))
 const mockSendTyping = mock(() => Promise.resolve({}))
@@ -40,6 +41,7 @@ mock.module('./protocol/session', () => ({
     sendMessage = mockSendMessage
     sendReply = mockSendReply
     createDirectChat = mockCreateDirectChat
+    joinOpenLink = mockJoinOpenLink
     markRead = mockMarkRead
     leaveChat = mockLeaveChat
     sendTyping = mockSendTyping
@@ -84,6 +86,7 @@ function resetAllMocks() {
   mockSendMessage.mockReset()
   mockSendReply.mockReset()
   mockCreateDirectChat.mockReset()
+  mockJoinOpenLink.mockReset()
   mockMarkRead.mockReset()
   mockLeaveChat.mockReset()
   mockSendTyping.mockReset()
@@ -1562,6 +1565,7 @@ describe('KakaoTalkClient', () => {
           active_members: 2,
           unread_count: 0,
           last_message: null,
+          link_id: '7777',
         })
         expect(mockGetOpenLinkInfo).toHaveBeenCalledTimes(1)
 
@@ -2257,6 +2261,161 @@ describe('KakaoTalkClient', () => {
 
       client.close()
     })
+  })
+
+  describe('open profile 1:1 (getOpenLink, joinOpenDirectOnce)', () => {
+    const big = (value: bigint) => Long.fromString(value.toString(), true)
+    const owner = 2n ** 53n + 9n
+    const link = '9223372036854775001'
+    const login = () => new KakaoTalkClient().login({ oauthToken: 'token', userId: '1', deviceUuid: 'device1' })
+
+    it('reads exactly one profile link and names its type, activation and exact owner', async () => {
+      mockGetOpenLinkInfo.mockResolvedValueOnce({
+        statusCode: 0,
+        body: { ols: [{ li: Long.fromString(link), lt: 1, ac: true, ln: 'Profile', olu: { userId: big(owner), nn: 'Owner' } }] },
+      })
+      const client = await login()
+      await expect(client.getOpenLink(link)).resolves.toEqual({
+        link_id: link, link_type: 1, active: true, owner_user_id: owner.toString(),
+      })
+      const [ids] = mockGetOpenLinkInfo.mock.calls[0] as [Long[]]
+      expect(ids.map(String)).toEqual([link])
+      client.close()
+    })
+
+    for (const [label, ols] of [
+      ['no link', []],
+      ['two links', [{ li: Long.fromString(link), lt: 1, ac: true, olu: { userId: 5 } }, { li: Long.fromString(link), lt: 1, ac: true, olu: { userId: 5 } }]],
+      ['another link', [{ li: Long.fromString('77'), lt: 1, ac: true, olu: { userId: 5 } }]],
+      ['no type', [{ li: Long.fromString(link), ac: true, olu: { userId: 5 } }]],
+      ['no activation', [{ li: Long.fromString(link), lt: 1, olu: { userId: 5 } }]],
+      ['no owner', [{ li: Long.fromString(link), lt: 1, ac: true }]],
+    ] as const) {
+      it(`refuses an INFOLINK answer with ${label}`, async () => {
+        mockGetOpenLinkInfo.mockResolvedValueOnce({ statusCode: 0, body: { ols } })
+        const client = await login()
+        await expect(client.getOpenLink(link)).rejects.toMatchObject({ code: 'get_open_link_failed' })
+        client.close()
+      })
+    }
+
+    it('joins once with the open profile and returns the answered room, link and owner unverified', async () => {
+      mockJoinOpenLink.mockResolvedValueOnce({
+        statusCode: 0,
+        body: {
+          status: 0,
+          chatRoom: { chatId: Long.fromString('9007199254740995'), type: 'OD' },
+          ol: { li: Long.fromString(link), olu: { userId: big(owner) } },
+          olu: { userId: 1, ptp: 16 },
+        },
+      })
+      const client = await login()
+      await expect(client.joinOpenDirectOnce(link, { kind: 'open_profile', link_id: '4401' })).resolves.toEqual({
+        success: true, status_code: 0, outcome: 'joined', chat_id: '9007199254740995', chat_type: 'OD',
+        link_id: link, owner_user_id: owner.toString(),
+      })
+      expect(mockJoinOpenLink).toHaveBeenCalledTimes(1)
+      const [li, profile] = mockJoinOpenLink.mock.calls[0] as [Long, { ptp: number; pli?: Long }]
+      expect(li.toString()).toBe(link)
+      expect(profile.ptp).toBe(16)
+      expect(profile.pli!.toString()).toBe('4401')
+      client.close()
+    })
+
+    it('joins with the main profile only as { ptp: 1 }', async () => {
+      mockJoinOpenLink.mockResolvedValueOnce({ statusCode: 0, body: { status: 0, chatRoom: { chatId: 5 }, ol: {} } })
+      const client = await login()
+      await expect(client.joinOpenDirectOnce(link, { kind: 'main' })).resolves.toMatchObject({ outcome: 'joined', chat_id: '5', owner_user_id: null })
+      expect(mockJoinOpenLink.mock.calls[0][1]).toEqual({ ptp: 1 })
+      client.close()
+    })
+
+    it('returns a non-zero body status as a definite refusal', async () => {
+      mockJoinOpenLink.mockResolvedValueOnce({ statusCode: 0, body: { status: -324 } })
+      const client = await login()
+      await expect(client.joinOpenDirectOnce(link, { kind: 'main' })).resolves.toEqual({
+        success: false, status_code: -324, outcome: 'rejected', chat_id: null, chat_type: null, link_id: null, owner_user_id: null,
+      })
+      expect(mockJoinOpenLink).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    for (const [label, response] of [
+      ['the synthetic connection close', { statusCode: -1, body: { error: 'connection closed' } }],
+    ] as const) {
+      it(`classifies ${label} as unknown and never asks again`, async () => {
+        mockJoinOpenLink.mockResolvedValueOnce(response)
+        const client = await login()
+        await expect(client.joinOpenDirectOnce(link, { kind: 'main' })).rejects.toMatchObject({
+          code: 'join_open_direct_unknown', responseFailureKind: 'transient_or_unknown',
+        })
+        expect(mockJoinOpenLink).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+    }
+
+    it('keeps what an answer named when its header contradicts body status 0, as unknown', async () => {
+      mockJoinOpenLink.mockResolvedValueOnce({
+        statusCode: -500,
+        body: { status: 0, chatRoom: { chatId: 5, type: 'OD' }, ol: { li: Long.fromString(link), olu: { userId: 77 } } },
+      })
+      const client = await login()
+      await expect(client.joinOpenDirectOnce(link, { kind: 'main' })).resolves.toEqual({
+        success: false, status_code: null, outcome: 'unknown', chat_id: '5', chat_type: 'OD', link_id: link, owner_user_id: '77',
+      })
+      expect(mockJoinOpenLink).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    it('keeps what an answer without a body status named, as unknown', async () => {
+      mockJoinOpenLink.mockResolvedValueOnce({
+        statusCode: 0,
+        body: { chatRoom: { chatId: 5 }, ol: { li: Long.fromString(link), olu: { userId: 77 } } },
+      })
+      const client = await login()
+      await expect(client.joinOpenDirectOnce(link, { kind: 'main' })).resolves.toEqual({
+        success: false, status_code: null, outcome: 'unknown', chat_id: '5', chat_type: null, link_id: link, owner_user_id: '77',
+      })
+      expect(mockJoinOpenLink).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    it('keeps the link and owner a join named even when its room id is unusable', async () => {
+      mockJoinOpenLink.mockResolvedValueOnce({
+        statusCode: 0,
+        body: { status: 0, chatRoom: { chatId: 0, type: 'OD' }, ol: { li: Long.fromString(link), olu: { userId: 77 } } },
+      })
+      const client = await login()
+      await expect(client.joinOpenDirectOnce(link, { kind: 'main' })).resolves.toEqual({
+        success: true, status_code: 0, outcome: 'joined', chat_id: null, chat_type: 'OD', link_id: link, owner_user_id: '77',
+      })
+      expect(mockJoinOpenLink).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    it('does not replay JOINLINK after the captured session closes during the operation', async () => {
+      mockJoinOpenLink.mockImplementationOnce(async () => {
+        const closeHandler = mockOnClose.mock.calls.at(-1)?.[0] as (() => void) | undefined
+        closeHandler?.()
+        throw new Error('Synthetic socket close')
+      })
+      const client = await login()
+      await expect(client.joinOpenDirectOnce(link, { kind: 'main' })).rejects.toMatchObject({ code: 'join_open_direct_unknown' })
+      expect(mockJoinOpenLink).toHaveBeenCalledTimes(1)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    for (const [linkId, profile] of [['0', { kind: 'main' }], [link, { kind: 'anon' }],
+      [link, { kind: 'open_profile', link_id: '01' }]] as const) {
+      it(`refuses ${linkId}/${JSON.stringify(profile)} before session acquisition`, async () => {
+        const client = await login()
+        await expect(client.joinOpenDirectOnce(linkId, profile as never)).rejects.toThrow()
+        expect(mockJoinOpenLink).not.toHaveBeenCalled()
+        expect(mockLogin).not.toHaveBeenCalled()
+        client.close()
+      })
+    }
   })
 
   describe('createDirectChatOnce', () => {
@@ -3162,6 +3321,9 @@ describe('KakaoTalkClient', () => {
         const snapshot = await client.enterRoomMemberSnapshot('100')
         expect(snapshot.complete).toBe(true)
         expect(snapshot.members).toHaveLength(1117)
+        // The profile this account uses here comes from its own olu as answered:
+        // its type stays 2 although the olu also carries a link.
+        expect(snapshot.self_open_profile).toEqual({ profile_type: 2, link_id: '55' })
         // The olu row is read as the open member it is: its nn is the name.
         const own = snapshot.members.find((m) => m.user_id === (base + 1n).toString())
         expect(own).toMatchObject({ nickname: 'Open self', profile_image_url: 'pi-self', full_profile_image_url: 'fpi-self',

@@ -111,6 +111,7 @@ test('read state preserves uint64 precision and room li, without reading content
     last_message_id: LOG,
     last_read_message_id: '0',
     link_id: LINK,
+    open_direct: null,
     unread_count: 0,
   })
   assert.equal(f.reads[0].toUnsigned().toString(), ROOM)

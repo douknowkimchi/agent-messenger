@@ -22,6 +22,7 @@ import {
   type KakaoChatReadState,
   type KakaoCreateDirectChatResult,
   type KakaoDeviceType,
+  type KakaoJoinOpenDirectResult,
   type KakaoLeaveChatResult,
   type KakaoLeaveChatOnceResult,
   type KakaoMarkReadResult,
@@ -30,6 +31,9 @@ import {
   type KakaoMessage,
   type KakaoMessagePage,
   type KakaoMultiPhotoExtra,
+  type KakaoOpenJoinProfile,
+  type KakaoOpenLink,
+  type KakaoOpenSelfProfile,
   type KakaoProfile,
   type KakaoReplyExtra,
   type KakaoReplyTarget,
@@ -235,6 +239,8 @@ interface MemberEntryProgressState {
   displayIds: Set<string>
   ids: string[]
   rows: Map<string, Record<string, unknown>>
+  /** The account's own olu profile from the CHATONROOM that read the ID list. */
+  selfProfile?: KakaoOpenSelfProfile
 }
 
 interface SessionState {
@@ -360,7 +366,7 @@ function positiveSignedInt64String(value: unknown): string | null {
   return id > 0n && id <= MAX_SIGNED_INT64 ? normalized : null
 }
 
-function parsePositiveSignedInt64(value: string, field: 'peer' | 'chat'): Long {
+function parsePositiveSignedInt64(value: string, field: 'peer' | 'chat' | 'link'): Long {
   if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
     throw new KakaoTalkError(`Invalid ${field}Id: expected canonical positive int64`, `invalid_${field}_id`)
   }
@@ -435,10 +441,11 @@ function formatChat(chat: ChatData, title: string | null, nameCache: MemberNameC
   const lastLog = chat.l as Record<string, unknown> | null
   const displayName = memberNames.join(', ') || null
   const chatId = longToString(chat.c)
+  const type = requiredChatType(chat.t)
 
   return {
     chat_id: chatId,
-    type: requiredChatType(chat.t),
+    type,
     display_name: displayName,
     display_member_ids: displayMemberIds(chat.i),
     title,
@@ -452,6 +459,9 @@ function formatChat(chat: ChatData, title: string | null, nameCache: MemberNameC
           sent_at: lastLog.sendAt as number,
         }
       : null,
+    // The open chat's own link (login list / CHATINFO `li`), strictly read;
+    // an open chat only, so a normal chat's answer keeps its v1 shape.
+    ...(isOpenKakaoChatType(type) ? { link_id: positiveSignedInt64String(chat.li) } : {}),
   }
 }
 
@@ -475,6 +485,8 @@ interface ChannelInfoData {
   displayMembers?: Array<Record<string, unknown>>
   chatMetas?: ChannelMetaEntry[]
   li?: unknown
+  /** OpenChannelInfoExtra.directChat (node-kakao): true for an open 1:1. */
+  directChat?: unknown
 }
 
 interface ChannelInfoResponse {
@@ -971,6 +983,19 @@ function openLinkUserAsMember(olu: Record<string, unknown>): Record<string, unkn
     if (olu[from] !== undefined) member[to] = olu[from]
   }
   return member
+}
+
+// The signed-in account's own olu as the profile it uses in this open chat:
+// its type (ptp) and, when present, its profile link (pli). An olu without an
+// integer type, or with a link that is not a canonical positive int64, names
+// no usable profile. A missing type is never filled in from the link.
+function openSelfProfile(olu: Record<string, unknown>): KakaoOpenSelfProfile | undefined {
+  const type = olu.ptp
+  if (typeof type !== 'number' || !Number.isSafeInteger(type) || type < 1) return undefined
+  if (olu.pli === undefined || olu.pli === null) return { profile_type: type, link_id: null }
+  if (readStateId(olu.pli) === '0') return { profile_type: type, link_id: null }
+  const link = positiveSignedInt64String(olu.pli)
+  return link === null ? undefined : { profile_type: type, link_id: link }
 }
 
 function exactMemberRecords(
@@ -1515,6 +1540,7 @@ export class KakaoTalkClient {
         last_message_id: readStateId(info.lastLogId),
         last_read_message_id: readStateId(info.lastSeenLogId),
         link_id: linkId === '0' ? null : linkId,
+        open_direct: isOpenKakaoChatType(type) && typeof info.directChat === 'boolean' ? info.directChat : null,
         unread_count:
           info.invalidNewMessageCount === false &&
           Number.isSafeInteger(info.newMessageCount) &&
@@ -1900,7 +1926,8 @@ export class KakaoTalkClient {
     // while it still holds, so a passing CHATINFO failure loses nothing.
     let progress: MemberEntryProgressState | undefined = resumed
     const entryInfo: { shape: KakaoTalkMemberEntryConsistency['entryShape'];
-      openSelf: KakaoTalkMemberEntryConsistency['openSelfRecord'] } = { shape: resumed ? 'resumed' : 'ids', openSelf: 'absent' }
+      openSelf: KakaoTalkMemberEntryConsistency['openSelfRecord']; selfProfile?: KakaoOpenSelfProfile } =
+      { shape: resumed ? 'resumed' : 'ids', openSelf: 'absent', selfProfile: resumed?.selfProfile }
     try {
       const before = await session.getChannelInfo(cid)
       check()
@@ -1952,6 +1979,7 @@ export class KakaoTalkClient {
         members: mergeMemberRecords(members.records, second.records).map(formatMember),
         complete: true,
         consistency_basis: 'entered_chatinfo_member',
+        ...(entryInfo.selfProfile ? { self_open_profile: entryInfo.selfProfile } : {}),
       }
     } catch (error) {
       const failure = wrapError(error, 'get_member_snapshot_failed')
@@ -1991,12 +2019,19 @@ export class KakaoTalkClient {
     check: () => void,
     keep: (progress: MemberEntryProgressState) => void,
     entryInfo: { shape: KakaoTalkMemberEntryConsistency['entryShape'];
-      openSelf: KakaoTalkMemberEntryConsistency['openSelfRecord'] },
+      openSelf: KakaoTalkMemberEntryConsistency['openSelfRecord']; selfProfile?: KakaoOpenSelfProfile },
   ): Promise<ReturnType<typeof exactMemberRecords>> {
     const entry = await session.enterRoom(cid)
     check()
     assertLocoOk(entry, 'CHATONROOM')
     if (longToString(entry.body.c) !== normalizedChatId) throw new Error('member_entry_chat_mismatch')
+    // The profile this account uses in the open chat, from its own olu only.
+    const ownOlu = entry.body.olu
+    if (ownOlu && typeof ownOlu === 'object' && !Array.isArray(ownOlu) && this.userId) {
+      if (memberIdKey(ownOlu as Record<string, unknown>) === longToString(parseUserId(this.userId))) {
+        entryInfo.selfProfile = openSelfProfile(ownOlu as Record<string, unknown>)
+      }
+    }
     // CHATONROOM can return full records even above 100 active members.
     // Accept that unambiguous wire shape; the exact identities and the
     // second CHATINFO count/consistency checks still apply below.
@@ -2070,6 +2105,7 @@ export class KakaoTalkClient {
       displayIds: first.ids,
       ids: [...requested.ids],
       rows: new Map(),
+      selfProfile: entryInfo.selfProfile,
     }
     keep(progress)
     return this.readMemberEntryBatches(session, cid, normalizedChatId, progress, check)
@@ -2526,6 +2562,97 @@ export class KakaoTalkClient {
         : { success: true, status_code: -310, outcome: 'existing', peer_id: peerId, chat_id: chatId }
     } catch (error) {
       throw wrapError(error, 'create_direct_chat_unknown', { classifyResponseFailure: true })
+    }
+  }
+
+  /**
+   * Read one open link (INFOLINK) and return only what identifies it: its
+   * link id, type (1=PROFILE, 2=CHANNEL), whether it is active and its owner's
+   * user id (ol.olu.userId). Read-only and asked once on the current session.
+   * Anything but exactly one link with these fields, the asked id among them,
+   * is refused; nothing is filled in.
+   */
+  async getOpenLink(linkId: string): Promise<KakaoOpenLink> {
+    const parsedLinkId = parsePositiveSignedInt64(linkId, 'link')
+    const session = await this.acquireSession()
+    try {
+      const response = await session.getOpenLinkInfo([parsedLinkId])
+      assertLocoOk(response, 'INFOLINK')
+      const ols = response.body.ols
+      if (!Array.isArray(ols) || ols.length !== 1) throw new Error('INFOLINK response invalid: not exactly one link')
+      const link = ols[0] as Record<string, unknown> | null
+      if (!link || typeof link !== 'object' || Array.isArray(link)) throw new Error('INFOLINK response invalid link')
+      if (positiveSignedInt64String(link.li) !== linkId) throw new Error('INFOLINK response invalid link id')
+      if (typeof link.lt !== 'number' || !Number.isSafeInteger(link.lt)) throw new Error('INFOLINK response invalid type')
+      if (typeof link.ac !== 'boolean') throw new Error('INFOLINK response invalid activation')
+      const owner = link.olu && typeof link.olu === 'object' && !Array.isArray(link.olu)
+        ? memberIdKey(link.olu as Record<string, unknown>) : null
+      if (owner === null) throw new Error('INFOLINK response invalid owner')
+      return { link_id: linkId, link_type: link.lt, active: link.ac, owner_user_id: owner }
+    } catch (error) {
+      throw wrapError(error, 'get_open_link_failed', { classifyResponseFailure: true })
+    }
+  }
+
+  /**
+   * Join one open profile link (JOINLINK) with the given profile of this
+   * account, at most once: one ready session, one packet, never through
+   * executeWithReconnect. Only the body status is Kakao's answer: a non-zero
+   * integer body status is a refusal; zero with a zero header and a canonical
+   * chatRoom.chatId is a join whose room and link the caller must still verify.
+   * Zero under a non-zero header, or an answer without an integer body status,
+   * is outcome 'unknown' with the room, link and owner the answer named. A
+   * missing acknowledgement throws as outcome-unknown. Neither may be retried
+   * automatically. Status 0 does not mean a new room was created.
+   */
+  async joinOpenDirectOnce(linkId: string, profile: KakaoOpenJoinProfile): Promise<KakaoJoinOpenDirectResult> {
+    const parsedLinkId = parsePositiveSignedInt64(linkId, 'link')
+    let wire: { ptp: 1 } | { ptp: 16; pli: Long }
+    if (profile?.kind === 'main') {
+      wire = { ptp: 1 }
+    } else if (profile?.kind === 'open_profile') {
+      wire = { ptp: 16, pli: parsePositiveSignedInt64(profile.link_id, 'link') }
+    } else {
+      throw new KakaoTalkError('Invalid open join profile', 'invalid_open_profile')
+    }
+    const session = await this.acquireSession()
+    try {
+      const response = await session.joinOpenLink(parsedLinkId, wire)
+      const header = response.statusCode
+      if (!Number.isSafeInteger(header) || isSyntheticConnectionClose(response)) {
+        throw new LocoResponseError('JOINLINK outcome unknown: transport acknowledgement missing', 'transient_or_unknown', {
+          serverStatus: Number.isSafeInteger(header) ? header : undefined,
+          responseStatusSource: Number.isSafeInteger(header) ? 'packet' : undefined,
+        })
+      }
+      const body = response.body && typeof response.body === 'object' ? response.body : {}
+      const status = body.status
+      if (typeof status === 'number' && Number.isSafeInteger(status) && status !== 0) {
+        return {
+          success: false, status_code: status, outcome: 'rejected',
+          chat_id: null, chat_type: null, link_id: null, owner_user_id: null,
+        }
+      }
+      // The answered room, link and owner are returned as read; a missing or
+      // unusable room id is null and never hides a link or owner the answer named.
+      const room = body.chatRoom as Record<string, unknown> | undefined
+      const chatId = room && typeof room === 'object' ? positiveSignedInt64String(room.chatId) : null
+      const ol = body.ol as Record<string, unknown> | undefined
+      const owner = ol && typeof ol === 'object' && ol.olu && typeof ol.olu === 'object' && !Array.isArray(ol.olu)
+        ? memberIdKey(ol.olu as Record<string, unknown>) : null
+      const named = {
+        chat_id: chatId,
+        chat_type: room && (typeof room.type === 'string' || (typeof room.type === 'number' && Number.isSafeInteger(room.type)))
+          ? room.type as string | number : null,
+        link_id: ol && typeof ol === 'object' ? positiveSignedInt64String(ol.li) : null,
+        owner_user_id: owner,
+      }
+      // No integer body status, or a header that contradicts body status 0:
+      // the join is unknown, but what the answer named is kept.
+      if (status !== 0 || header !== 0) return { success: false, status_code: null, outcome: 'unknown', ...named }
+      return { success: true, status_code: 0, outcome: 'joined', ...named }
+    } catch (error) {
+      throw wrapError(error, 'join_open_direct_unknown', { classifyResponseFailure: true })
     }
   }
 

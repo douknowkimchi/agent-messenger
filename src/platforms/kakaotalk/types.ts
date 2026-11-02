@@ -92,6 +92,8 @@ export interface KakaoChatReadState {
   last_read_message_id: string | null
   /** Positive room li for an open chat only; never a member profile link. */
   link_id: string | null
+  /** CHATINFO directChat of an open chat (true for an open 1:1); null when absent or not an open chat. */
+  open_direct: boolean | null
   /** Non-negative safe integer only when the provider explicitly marks it valid. */
   unread_count: number | null
 }
@@ -104,6 +106,8 @@ export interface KakaoChat {
   title: string | null
   active_members: number
   unread_count: number
+  /** The open chat's own link id (room li), canonical positive int64; null for normal chats or when absent. Never a member's profile link. */
+  link_id?: string | null
   last_message: {
     author_id: number
     author_name: string | null
@@ -151,7 +155,72 @@ export interface KakaoMemberSnapshot {
   members: KakaoMember[]
   complete: true
   consistency_basis: 'stable_double_read_chatinfo_getmem' | 'entered_chatinfo_member'
+  /**
+   * An explicit entry's own open-link record (CHATONROOM olu) of the signed-in
+   * account: the profile type it uses in this open chat and, for an open
+   * profile, that profile's link. Absent when the entry answered none.
+   */
+  self_open_profile?: KakaoOpenSelfProfile
 }
+
+/** The signed-in account's profile in one open chat, as its CHATONROOM olu named it. */
+export interface KakaoOpenSelfProfile {
+  /** OpenProfileType: 1=MAIN, 2=KAKAO_ANON, 4/8 other, 16=OPEN_PROFILE. */
+  profile_type: number
+  /** Canonical positive int64 profile link; null when olu carries none. */
+  link_id: string | null
+}
+
+/** One open link read by INFOLINK, reduced to what identifies it. */
+export interface KakaoOpenLink {
+  link_id: string
+  /** OpenLinkType: 1=PROFILE, 2=CHANNEL. */
+  link_type: number
+  active: boolean
+  /** The link owner's user id (ol.olu.userId), exact decimal string. */
+  owner_user_id: string
+}
+
+/** The profile the signed-in account joins an open profile link with. */
+export type KakaoOpenJoinProfile = { kind: 'main' } | { kind: 'open_profile'; link_id: string }
+
+export type KakaoJoinOpenDirectResult =
+  | {
+      success: true
+      status_code: 0
+      outcome: 'joined'
+      /** chatRoom.chatId when canonical; null when missing or unusable (the join stays unconfirmed). */
+      chat_id: string | null
+      /** chatRoom.type as answered (for example 'OD'); null when absent. */
+      chat_type: string | number | null
+      /** ol.li as answered. */
+      link_id: string | null
+      /** ol.olu.userId: the joined link's owner. */
+      owner_user_id: string | null
+    }
+  | {
+      success: false
+      status_code: number
+      outcome: 'rejected'
+      chat_id: null
+      chat_type: null
+      link_id: null
+      owner_user_id: null
+    }
+  | {
+      /**
+       * Body status 0 under a non-zero packet header: whether Kakao joined is
+       * unknown. The room, link and owner the answer named are returned as
+       * read so a caller can still see an answer naming another link or owner.
+       */
+      success: false
+      status_code: null
+      outcome: 'unknown'
+      chat_id: string | null
+      chat_type: string | number | null
+      link_id: string | null
+      owner_user_id: string | null
+    }
 
 export interface KakaoSendResult {
   success: boolean
@@ -306,6 +375,7 @@ export const KakaoChatSchema = z.object({
   title: z.string().nullable(),
   active_members: z.number(),
   unread_count: z.number(),
+  link_id: z.string().nullable().optional(),
   last_message: z
     .object({
       author_id: z.number(),
@@ -352,6 +422,9 @@ export const KakaoMemberSnapshotSchema = z.object({
   members: z.array(KakaoMemberSchema),
   complete: z.literal(true),
   consistency_basis: z.enum(['stable_double_read_chatinfo_getmem', 'entered_chatinfo_member']),
+  self_open_profile: z
+    .object({ profile_type: z.number().int(), link_id: z.string().nullable() })
+    .optional(),
 })
 
 export const KakaoSendResultSchema = z.object({

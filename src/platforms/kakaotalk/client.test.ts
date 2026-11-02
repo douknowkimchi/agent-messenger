@@ -3071,7 +3071,7 @@ describe('KakaoTalkClient', () => {
     })
     it('names the CHATINFO display-member rule and ID shapes that refused the room, before any entry', async () => {
       const client = await connected()
-      const overSafe = { low: 0, high: 0x200000 } // 2^53, one above Number.MAX_SAFE_INTEGER
+      const overSafe = 2 ** 53 + 2 // a JS number past Number.MAX_SAFE_INTEGER has lost its exact value
       const base = { safeIds: 0, overSafeIds: 0, nonPositiveIds: 0, missingIds: 0, otherIds: 0, nonObjects: 0, duplicates: 0 }
       const cases: Array<[Array<unknown>, number, Record<string, unknown>]> = [
         [[member(1), { userId: overSafe, nickName: 'private-name' }, member(2)], 1117,
@@ -3108,12 +3108,43 @@ describe('KakaoTalkClient', () => {
       expect(mockMarkRead).not.toHaveBeenCalled()
       client.close()
     })
+    it('reads an open room whose 1117 members all carry IDs above 2^53, keeping every ID exact', async () => {
+      // Shape observed on the real 1117-member open room: CHATINFO shows the 1116
+      // other members, every one above Number.MAX_SAFE_INTEGER.
+      const base = 2n ** 53n
+      const big = (i: number) => {
+        const n = base + BigInt(i)
+        return { low: Number(n & 0xffffffffn), high: Number(n >> 32n) }
+      }
+      const self = base + 1n
+      const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: self.toString() })
+      await client.getChats({ resolveTitles: false })
+      const rows = Array.from({ length: 1117 }, (_, i) => ({ userId: big(i + 1), nickName: `Open ${i + 1}` }))
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(1117, rows.slice(1)))
+      mockGetAllMembers.mockResolvedValue({ statusCode: 0, body: { members: rows } })
+      const snapshot = await client.getMemberSnapshot('100')
+      expect(snapshot.members).toHaveLength(1117)
+      expect(snapshot.members[0].user_id).toBe(self.toString())
+      expect(snapshot.members[1].user_id).toBe((base + 2n).toString())
+      expect(new Set(snapshot.members.map((m) => m.user_id)).size).toBe(1117)
+
+      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), mi: rows.map((m) => m.userId) } })
+      mockGetMembersByIds.mockImplementation(async (_chat, ids) => ({
+        statusCode: 0,
+        body: { chatId: makeLong(100), members: rows.filter((m) => ids.some((id) => id.toString() === (base + BigInt(m.nickName.slice(5))).toString())) },
+      }))
+      const entered = await client.enterRoomMemberSnapshot('100')
+      expect(entered.members).toHaveLength(1117)
+      expect(new Set(entered.members.map((m) => m.user_id))).toEqual(new Set(rows.map((_, i) => (base + BigInt(i + 1)).toString())))
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(12)
+      client.close()
+    })
     it('names a GETMEM record refusal and keeps it on getMembers', async () => {
       const client = await connected()
       mockGetChannelInfo.mockResolvedValue(memberChannelInfo(2, [member(1)]))
       mockGetAllMembers.mockResolvedValue({
         statusCode: 0,
-        body: { members: [member(1), { userId: { low: 5, high: 0x7fffffff }, nickName: 'private-name' }] },
+        body: { members: [member(1), { userId: 2 ** 53 + 2, nickName: 'private-name' }] },
       })
       let caught: unknown
       try {

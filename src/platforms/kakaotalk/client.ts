@@ -101,9 +101,12 @@ export interface KakaoTalkMemberRecordFailure {
   rule: 'not_array' | 'not_object' | 'id_invalid' | 'duplicate' | 'exceeds_active'
   recordCount: number | null
   activeCount: number | null
-  /** Positive and within Number.MAX_SAFE_INTEGER: accepted by the exact list. */
+  /** Positive and within Number.MAX_SAFE_INTEGER. */
   safeIds: number
-  /** Positive integer above Number.MAX_SAFE_INTEGER (number or unsigned Long). */
+  /**
+   * Positive integer above Number.MAX_SAFE_INTEGER: an unsigned Long is an exact
+   * member ID (open-chat members use them); a JS number this large is not.
+   */
   overSafeIds: number
   nonPositiveIds: number
   missingIds: number
@@ -843,7 +846,9 @@ function memberIdKey(member: Record<string, unknown>): string | null {
     return null
   }
   const numeric = (BigInt((high as number) >>> 0) << 32n) | BigInt((low as number) >>> 0)
-  return numeric > 0n && numeric <= BigInt(Number.MAX_SAFE_INTEGER) ? numeric.toString() : null
+  // The exact unsigned 64-bit decimal, as longToString, displayMemberIds and
+  // parseLong use; open-chat members carry IDs above 2^53.
+  return numeric > 0n ? numeric.toString() : null
 }
 
 function mergeMemberRecords(

@@ -92,6 +92,27 @@ export interface KakaoTalkMemberEntryFailure {
 }
 
 /**
+ * Why an exact member list (CHATINFO display members, GETMEM, CHATONROOM or
+ * MEMBER records) was refused: the first rule that failed and counts of the
+ * user-ID shapes over the whole list. Counts only; no identities or fields.
+ */
+export interface KakaoTalkMemberRecordFailure {
+  source: 'CHATINFO' | 'GETMEM' | 'CHATONROOM' | 'MEMBER'
+  rule: 'not_array' | 'not_object' | 'id_invalid' | 'duplicate' | 'exceeds_active'
+  recordCount: number | null
+  activeCount: number | null
+  /** Positive and within Number.MAX_SAFE_INTEGER: accepted by the exact list. */
+  safeIds: number
+  /** Positive integer above Number.MAX_SAFE_INTEGER (number or unsigned Long). */
+  overSafeIds: number
+  nonPositiveIds: number
+  missingIds: number
+  otherIds: number
+  nonObjects: number
+  duplicates: number
+}
+
+/**
  * What an explicit entry that stopped after CHATONROOM had already read: the
  * room's whole ID list and the MEMBER rows received so far. The visible part
  * is counts only; the IDs and rows stay inside this client. It continues once,
@@ -112,6 +133,7 @@ export class KakaoTalkError extends Error {
   readonly getChatFailureReason?: KakaoTalkGetChatFailureReason
   readonly memberSnapshotFailure?: Readonly<KakaoTalkMemberSnapshotFailure>
   readonly memberEntryFailure?: Readonly<KakaoTalkMemberEntryFailure>
+  readonly memberRecordFailure?: Readonly<KakaoTalkMemberRecordFailure>
   /** Set only on an explicit entry failure that kept its ID list and session. */
   memberEntryProgress?: KakaoMemberEntryProgress
 
@@ -126,6 +148,7 @@ export class KakaoTalkError extends Error {
       getChatFailureReason?: KakaoTalkGetChatFailureReason
       memberSnapshotFailure?: Readonly<KakaoTalkMemberSnapshotFailure>
       memberEntryFailure?: Readonly<KakaoTalkMemberEntryFailure>
+      memberRecordFailure?: Readonly<KakaoTalkMemberRecordFailure>
     },
   ) {
     super(message, options)
@@ -137,6 +160,17 @@ export class KakaoTalkError extends Error {
     this.getChatFailureReason = options?.getChatFailureReason
     this.memberSnapshotFailure = options?.memberSnapshotFailure
     this.memberEntryFailure = options?.memberEntryFailure
+    this.memberRecordFailure = options?.memberRecordFailure
+  }
+}
+
+/** An exact member list refused with its aggregate record shape. */
+class MemberRecordError extends Error {
+  constructor(
+    message: string,
+    readonly memberRecordFailure: Readonly<KakaoTalkMemberRecordFailure>,
+  ) {
+    super(message)
   }
 }
 
@@ -577,11 +611,13 @@ function wrapError(
       getChatFailureReason,
       memberSnapshotFailure: error.memberSnapshotFailure,
       memberEntryFailure: error.memberEntryFailure,
+      memberRecordFailure: error.memberRecordFailure,
     })
   }
   const message = error instanceof Error ? error.message : String(error)
   return new KakaoTalkError(message, code, {
     cause: error,
+    memberRecordFailure: error instanceof MemberRecordError ? error.memberRecordFailure : undefined,
     serverStatus: error instanceof LocoResponseError ? error.serverStatus : undefined,
     responseStatusSource: error instanceof LocoResponseError ? error.responseStatusSource : undefined,
     responseFailureKind:
@@ -837,26 +873,78 @@ function mergeMemberRecords(
   return merged
 }
 
+type MemberRecordSource = KakaoTalkMemberRecordFailure['source']
+
+function memberIdShape(value: unknown): 'safe' | 'overSafe' | 'nonPositive' | 'missing' | 'other' {
+  if (value === undefined || value === null) return 'missing'
+  let numeric: bigint
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value)) return 'other'
+    numeric = BigInt(value)
+  } else if (typeof value === 'object' && 'low' in value && 'high' in value) {
+    const { low, high } = value as { low: unknown; high: unknown }
+    if (!Number.isInteger(low) || !Number.isInteger(high) ||
+        (low as number) < -0x80000000 || (low as number) > 0xffffffff ||
+        (high as number) < -0x80000000 || (high as number) > 0xffffffff) return 'other'
+    // The same unsigned reading memberIdKey uses.
+    numeric = (BigInt((high as number) >>> 0) << 32n) | BigInt((low as number) >>> 0)
+  } else {
+    return 'other'
+  }
+  if (numeric <= 0n) return 'nonPositive'
+  return numeric <= BigInt(Number.MAX_SAFE_INTEGER) ? 'safe' : 'overSafe'
+}
+
+function memberRecordError(
+  value: unknown,
+  source: MemberRecordSource,
+  rule: KakaoTalkMemberRecordFailure['rule'],
+  activeCount: number | null,
+): MemberRecordError {
+  const failure: KakaoTalkMemberRecordFailure = {
+    source, rule, recordCount: Array.isArray(value) ? value.length : null, activeCount,
+    safeIds: 0, overSafeIds: 0, nonPositiveIds: 0, missingIds: 0, otherIds: 0, nonObjects: 0, duplicates: 0,
+  }
+  const seen = new Set<string>()
+  for (const raw of Array.isArray(value) ? value : []) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      failure.nonObjects++
+      continue
+    }
+    const shape = memberIdShape((raw as Record<string, unknown>).userId)
+    failure[`${shape}Ids` as 'safeIds' | 'overSafeIds' | 'nonPositiveIds' | 'missingIds' | 'otherIds']++
+    const id = memberIdKey(raw as Record<string, unknown>)
+    if (id && seen.has(id)) failure.duplicates++
+    if (id) seen.add(id)
+  }
+  const message = rule === 'not_array' ? `${source} member snapshot missing` : `${source} member snapshot invalid`
+  return new MemberRecordError(message, Object.freeze(failure))
+}
+
 function exactMemberRecords(
   value: unknown,
-  source: string,
+  source: MemberRecordSource,
+  activeCount: number | null = null,
 ): {
   records: Array<Record<string, unknown>>
   ids: Set<string>
 } {
   if (!Array.isArray(value)) {
-    throw new Error(`${source} member snapshot missing`)
+    throw memberRecordError(value, source, 'not_array', activeCount)
   }
   const records: Array<Record<string, unknown>> = []
   const ids = new Set<string>()
   for (const raw of value) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-      throw new Error(`${source} member snapshot invalid`)
+      throw memberRecordError(value, source, 'not_object', activeCount)
     }
     const record = raw as Record<string, unknown>
     const id = memberIdKey(record)
-    if (!id || ids.has(id)) {
-      throw new Error(`${source} member snapshot invalid`)
+    if (!id) {
+      throw memberRecordError(value, source, 'id_invalid', activeCount)
+    }
+    if (ids.has(id)) {
+      throw memberRecordError(value, source, 'duplicate', activeCount)
     }
     ids.add(id)
     records.push(record)
@@ -882,9 +970,9 @@ function channelMemberView(
 } {
   const info = extractChannelInfo(body, expectedChatId)
   const activeMembers = requiredNonNegativeInteger(info.activeMembersCount, 'activeMembersCount')
-  const displayMembers = exactMemberRecords(info.displayMembers ?? [], 'CHATINFO')
+  const displayMembers = exactMemberRecords(info.displayMembers ?? [], 'CHATINFO', activeMembers)
   if (displayMembers.records.length > activeMembers) {
-    throw new Error('CHATINFO member snapshot invalid')
+    throw memberRecordError(info.displayMembers, 'CHATINFO', 'exceeds_active', activeMembers)
   }
   return {
     activeMembers,
@@ -1937,6 +2025,7 @@ export class KakaoTalkClient {
           cause: error,
           serverStatus: error.serverStatus,
           memberSnapshotFailure: error.memberSnapshotFailure,
+          memberRecordFailure: error.memberRecordFailure,
         })
       }
       throw error

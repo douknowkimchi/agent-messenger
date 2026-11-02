@@ -5,6 +5,7 @@ export type {
   KakaoTalkClientOptions,
   KakaoSessionEvent,
   KakaoTalkGetChatFailureReason,
+  KakaoTalkMemberRecordFailure,
   KakaoTalkMemberSnapshotFailure,
   KakaoTalkResponseFailureKind,
   KakaoTalkResponseStatusSource,

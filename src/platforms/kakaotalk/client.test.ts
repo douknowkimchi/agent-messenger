@@ -3069,6 +3069,67 @@ describe('KakaoTalkClient', () => {
       expect(mockLogin).toHaveBeenCalledTimes(1)
       client.close()
     })
+    it('names the CHATINFO display-member rule and ID shapes that refused the room, before any entry', async () => {
+      const client = await connected()
+      const overSafe = { low: 0, high: 0x200000 } // 2^53, one above Number.MAX_SAFE_INTEGER
+      const base = { safeIds: 0, overSafeIds: 0, nonPositiveIds: 0, missingIds: 0, otherIds: 0, nonObjects: 0, duplicates: 0 }
+      const cases: Array<[Array<unknown>, number, Record<string, unknown>]> = [
+        [[member(1), { userId: overSafe, nickName: 'private-name' }, member(2)], 1117,
+          { rule: 'id_invalid', recordCount: 3, safeIds: 2, overSafeIds: 1 }],
+        [[member(1), { nickName: 'private-name' }], 1117, { rule: 'id_invalid', recordCount: 2, safeIds: 1, missingIds: 1 }],
+        [[member(1), { userId: makeLong(0) }], 1117, { rule: 'id_invalid', recordCount: 2, safeIds: 1, nonPositiveIds: 1 }],
+        [[member(1), { userId: 'private-id' }], 1117, { rule: 'id_invalid', recordCount: 2, safeIds: 1, otherIds: 1 }],
+        [[member(1), member(1)], 1117, { rule: 'duplicate', recordCount: 2, safeIds: 2, duplicates: 1 }],
+        [[member(1), null], 1117, { rule: 'not_object', recordCount: 2, safeIds: 1, nonObjects: 1 }],
+        [[member(1), member(2), member(3)], 2, { rule: 'exceeds_active', recordCount: 3, safeIds: 3 }],
+      ]
+      for (const [display, active, expected] of cases) {
+        mockGetChannelInfo.mockResolvedValue(memberChannelInfo(active, display as Array<Record<string, unknown>>))
+        for (const read of [() => client.enterRoomMemberSnapshot('100'), () => client.getMemberSnapshot('100')]) {
+          let caught: unknown
+          try {
+            await read()
+          } catch (error) {
+            caught = error
+          }
+          expect(caught).toBeInstanceOf(KakaoTalkError)
+          const error = caught as KakaoTalkError
+          expect(error.code).toBe('get_member_snapshot_failed')
+          expect(error.message).toBe('CHATINFO member snapshot invalid')
+          expect(error.memberRecordFailure).toEqual({ ...base, source: 'CHATINFO', activeCount: active, ...expected })
+          expect(Object.isFrozen(error.memberRecordFailure)).toBe(true)
+          expect(JSON.stringify(error.memberRecordFailure)).not.toContain('private-')
+        }
+      }
+      // Refused at CHATINFO: no entry, member read or read mark happened.
+      expect(mockEnterRoom).not.toHaveBeenCalled()
+      expect(mockGetMembersByIds).not.toHaveBeenCalled()
+      expect(mockGetAllMembers).not.toHaveBeenCalled()
+      expect(mockMarkRead).not.toHaveBeenCalled()
+      client.close()
+    })
+    it('names a GETMEM record refusal and keeps it on getMembers', async () => {
+      const client = await connected()
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(2, [member(1)]))
+      mockGetAllMembers.mockResolvedValue({
+        statusCode: 0,
+        body: { members: [member(1), { userId: { low: 5, high: 0x7fffffff }, nickName: 'private-name' }] },
+      })
+      let caught: unknown
+      try {
+        await client.getMembers('100')
+      } catch (error) {
+        caught = error
+      }
+      const error = caught as KakaoTalkError
+      expect(error.code).toBe('get_members_failed')
+      expect(error.message).toBe('GETMEM member snapshot invalid')
+      expect(error.memberRecordFailure).toEqual({
+        source: 'GETMEM', rule: 'id_invalid', recordCount: 2, activeCount: null,
+        safeIds: 1, overSafeIds: 1, nonPositiveIds: 0, missingIds: 0, otherIds: 0, nonObjects: 0, duplicates: 0,
+      })
+      client.close()
+    })
     it('rejects partial MEMBER batches without retry or login', async () => {
       const client = await connected()
       mockGetChannelInfo.mockResolvedValue(memberChannelInfo(112))

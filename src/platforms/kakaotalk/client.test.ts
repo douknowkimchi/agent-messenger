@@ -3146,7 +3146,10 @@ describe('KakaoTalkClient', () => {
         return { low: Number(n & 0xffffffffn), high: Number(n >> 32n) }
       }
       const others = Array.from({ length: 1116 }, (_, i) => ({ userId: big(i + 2), nickName: `Open ${i + 2}` }))
+      // The account as an m record (OpenMemberStruct) and as Kakao's olu
+      // (OpenLinkChannelUserStruct: nickname `nn`, permission `lmt`).
       const self = { userId: big(1), nickName: 'Open self' }
+      const olu = { userId: big(1), nn: 'Open self', ptp: 2, lmt: 2, pi: 'pi-self', fpi: 'fpi-self', opi: 'opi-self', opt: 7, pli: makeLong(55) }
       async function openClient() {
         const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: (base + 1n).toString() })
         await client.getChats({ resolveTitles: false })
@@ -3155,18 +3158,21 @@ describe('KakaoTalkClient', () => {
       }
       it('takes the 1116 listed members plus olu as the whole 1117 roster without MEMBER', async () => {
         const client = await openClient()
-        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: others, olu: self } })
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: others, olu } })
         const snapshot = await client.enterRoomMemberSnapshot('100')
         expect(snapshot.complete).toBe(true)
         expect(snapshot.members).toHaveLength(1117)
-        expect(snapshot.members.some((m) => m.user_id === (base + 1n).toString())).toBe(true)
+        // The olu row is read as the open member it is: its nn is the name.
+        const own = snapshot.members.find((m) => m.user_id === (base + 1n).toString())
+        expect(own).toMatchObject({ nickname: 'Open self', profile_image_url: 'pi-self', full_profile_image_url: 'fpi-self',
+          original_profile_image_url: 'opi-self', open_token: 7, open_profile_link_id: '55', open_permission: 2 })
         expect(mockGetMembersByIds).not.toHaveBeenCalled()
         expect(mockEnterRoom).toHaveBeenCalledTimes(1)
         client.close()
       })
       it('still refuses a capped list and names its counts, shape and olu use', async () => {
         const client = await openClient()
-        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: others.slice(0, 1000), olu: self } })
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: others.slice(0, 1000), olu } })
         let caught: unknown
         try {
           await client.enterRoomMemberSnapshot('100')
@@ -3224,7 +3230,7 @@ describe('KakaoTalkClient', () => {
       })
       it('does not add olu twice and reports it as already present', async () => {
         const client = await openClient()
-        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [self, ...others.slice(0, 1000)], olu: self } })
+        mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [self, ...others.slice(0, 1000)], olu } })
         let caught: unknown
         try {
           await client.enterRoomMemberSnapshot('100')

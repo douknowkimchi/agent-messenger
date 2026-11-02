@@ -957,6 +957,14 @@ function memberRecordError(
   return new MemberRecordError(message, Object.freeze(failure))
 }
 
+// `olu` is Kakao's OpenLinkChannelUserStruct, not an `m` record: its name is
+// `nn` and its permission `lmt` (node-kakao structToOpenLinkChannelUserInfo).
+// Read as the open member (OpenMemberStruct) it stands for, so the account's
+// row keeps its name, photos, open token, profile link and permission.
+function openLinkUserAsMember(olu: Record<string, unknown>): Record<string, unknown> {
+  return { userId: olu.userId, nickName: olu.nn, pi: olu.pi, fpi: olu.fpi, opi: olu.opi, opt: olu.opt, pli: olu.pli, mt: olu.lmt }
+}
+
 function exactMemberRecords(
   value: unknown,
   source: MemberRecordSource,
@@ -2002,7 +2010,8 @@ export class KakaoTalkClient {
           entryInfo.openSelf = 'present'
         } else if (id && id === account) {
           entryInfo.openSelf = 'added'
-          return exactMemberRecords([...(entry.body.m as unknown[]), olu], 'CHATONROOM')
+          return exactMemberRecords([...(entry.body.m as unknown[]), openLinkUserAsMember(olu as Record<string, unknown>)],
+            'CHATONROOM')
         } else if (id) {
           entryInfo.openSelf = 'foreign'
         }

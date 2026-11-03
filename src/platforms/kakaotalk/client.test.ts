@@ -3763,6 +3763,228 @@ describe('KakaoTalkClient', () => {
     })
   })
 
+  describe('getSelectedMembersOnce', () => {
+    const chatId = '9007199254740993'
+    const peer = '9007199254740994'
+    const self = '9223372036854775807'
+    const row = (id: string) => ({ userId: Long.fromString(id), nickName: `member-${id}`, ptp: 16,
+      pli: Long.fromString('9007199254740995'), profileImageUrl: 'https://example.test/photo' })
+    const answer = (ids = [peer]) => ({ statusCode: 0, body: { chatId: Long.fromString(chatId), members: ids.map(row) } })
+    async function ready() {
+      const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: '1' })
+      await client.getChats({ resolveTitles: false })
+      return client
+    }
+    async function rejectedResponse(response: unknown) {
+      const client = await ready()
+      mockGetMembersByIds.mockResolvedValueOnce(response)
+      await expect(client.getSelectedMembersOnce(chatId, [peer])).rejects.toMatchObject({ code: 'get_selected_members_failed' })
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      expect(mockGetAllMembers).not.toHaveBeenCalled()
+      expect(mockEnterRoom).not.toHaveBeenCalled()
+      client.close()
+    }
+
+    for (const ids of [[peer], [self, peer]]) {
+      it(`returns exact ${ids.length} rows and preserves adjacent large IDs and profile fields`, async () => {
+        const client = await ready()
+        mockGetMembersByIds.mockResolvedValueOnce(answer([...ids].reverse()))
+        const members = await client.getSelectedMembersOnce(chatId, ids)
+        expect(members.map((m) => m.user_id)).toEqual([...ids].reverse())
+        expect(members[0]).toMatchObject({ open_profile_type: 16, open_profile_link_id: '9007199254740995',
+          profile_image_url: 'https://example.test/photo' })
+        const call = mockGetMembersByIds.mock.calls[0] as unknown as [Long, Long[]]
+        expect(call[0].toString()).toBe(chatId)
+        expect(call[1].map((id) => id.toString())).toEqual(ids)
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+        expect(mockGetAllMembers).not.toHaveBeenCalled()
+        expect(mockGetChannelInfo).not.toHaveBeenCalled()
+        expect(mockEnterRoom).not.toHaveBeenCalled()
+        expect(mockLogin).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+    }
+    for (const pli of [Number('9007199254740993'), { low: 0x100000001, high: 0 },
+      { low: 1, high: 0x100000000 }, { low: 1.5, high: 0 }, Long.fromString('9223372036854775808'),
+      '18446744073709551617', '01', -1, true, {}]) {
+      it(`rejects invalid selected raw profile link ${JSON.stringify(pli)} before conversion`, async () => {
+        const client = await ready()
+        mockGetMembersByIds.mockResolvedValueOnce({ ...answer(), body: { ...answer().body,
+          members: [{ ...row(peer), pli }] } })
+        await expect(client.getSelectedMembersOnce(chatId, [peer])).rejects.toThrow('selected_member_link_invalid')
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+    }
+    for (const pli of [undefined, null, 0, '0', Long.ZERO]) {
+      it(`keeps absent/zero selected raw profile link ${JSON.stringify(pli)} unobserved`, async () => {
+        const client = await ready()
+        mockGetMembersByIds.mockResolvedValueOnce({ ...answer(), body: { ...answer().body,
+          members: [{ ...row(peer), pli }] } })
+        expect((await client.getSelectedMembersOnce(chatId, [peer]))[0].open_profile_link_id).toBeNull()
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+    }
+    for (const pli of [Long.fromString('9007199254740993'), '9007199254740993', Long.MAX_VALUE, 42]) {
+      it(`normalizes valid selected raw profile link ${JSON.stringify(pli)} without loss`, async () => {
+        const client = await ready()
+        const raw = { ...row(peer), pli }
+        mockGetMembersByIds.mockResolvedValueOnce({ ...answer(), body: { ...answer().body, members: [raw] } })
+        expect((await client.getSelectedMembersOnce(chatId, [peer]))[0].open_profile_link_id).toBe(String(pli))
+        expect(raw.pli).toBe(pli)
+        client.close()
+      })
+    }
+    for (const ids of [new Array<string>(1), new Array<string>(2),
+      Object.assign(new Array<string>(2), { 0: peer }), Object.assign(new Array<string>(2), { 1: peer })]) {
+      it(`rejects sparse selected input ${JSON.stringify(ids)} without dispatch on a prepared session`, async () => {
+        const client = await ready()
+        await expect(client.getSelectedMembersOnce(chatId, ids)).rejects.toMatchObject({ code: 'invalid_user_id' })
+        expect(mockGetMembersByIds).not.toHaveBeenCalled()
+        expect(mockLogin).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+    }
+    for (const invalid of ['', '0', '-1', '+1', '01', ' 1', '1.0', '1e2', '9223372036854775808',
+      '18446744073709551617', null, undefined, 9007199254740992, {}, true]) {
+      it(`rejects noncanonical chat/user input ${JSON.stringify(invalid)} before any connection`, async () => {
+        const client = new KakaoTalkClient()
+        await expect(client.getSelectedMembersOnce(invalid as string, [peer])).rejects.toMatchObject({ code: 'invalid_chat_id' })
+        await expect(client.getSelectedMembersOnce(chatId, [invalid as string])).rejects.toMatchObject({ code: 'invalid_user_id' })
+        expect(mockLogin).not.toHaveBeenCalled()
+        expect(mockGetMembersByIds).not.toHaveBeenCalled()
+        client.close()
+      })
+    }
+    for (const invalid of [[], [peer, peer], [peer, self, '1'], null, undefined, '1', {}]) {
+      it(`rejects selection count/duplicates ${JSON.stringify(invalid)} without acquisition`, async () => {
+        const client = new KakaoTalkClient()
+        await expect(client.getSelectedMembersOnce(chatId, invalid as string[])).rejects.toMatchObject({ code: 'get_selected_members_failed' })
+        expect(mockLogin).not.toHaveBeenCalled()
+        expect(mockGetMembersByIds).not.toHaveBeenCalled()
+        client.close()
+      })
+    }
+    it('refuses a lazy authenticated client until the session is prepared', async () => {
+      const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: '1' })
+      await expect(client.getSelectedMembersOnce(chatId, [peer])).rejects.toThrow('selected_member_session_changed')
+      expect(mockLogin).not.toHaveBeenCalled()
+      expect(mockGetMembersByIds).not.toHaveBeenCalled()
+      client.close()
+    })
+    for (const failure of ['connection_admission_denied', 'connection_admission_failed']) {
+      it(`refuses ${failure} even while a prepared session remains`, async () => {
+        const client = await ready()
+        const internals = client as unknown as { admissionFailure: string | null; state: unknown }
+        expect(internals.state).not.toBeNull()
+        internals.admissionFailure = failure
+        await expect(client.getSelectedMembersOnce(chatId, [peer])).rejects.toThrow('selected_member_session_changed')
+        expect(mockGetMembersByIds).not.toHaveBeenCalled()
+        expect(mockLogin).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+    }
+    it('rejects late success if admission is blocked with the same prepared state', async () => {
+      const client = await ready()
+      const internals = client as unknown as { admissionFailure: string | null; state: unknown }
+      const state = internals.state
+      let resolve!: (value: unknown) => void
+      mockGetMembersByIds.mockImplementationOnce(() => new Promise((r) => { resolve = r }))
+      const pending = client.getSelectedMembersOnce(chatId, [peer])
+      internals.admissionFailure = 'connection_admission_denied'
+      expect(internals.state).toBe(state)
+      resolve(answer())
+      await expect(pending).rejects.toThrow('selected_member_session_changed')
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+    for (const invalid of [undefined, null, 0, Number(chatId), '9007199254740992', '18446744073709551617',
+      Long.fromString('9007199254740992'), { low: 1, high: 0.5 }, { low: 0x100000000, high: 0 }]) {
+      it(`rejects missing/wrong/unsafe response chat ${JSON.stringify(invalid)}`, async () => {
+        await rejectedResponse({ ...answer(), body: { ...answer().body, chatId: invalid } })
+      })
+    }
+    for (const invalid of [undefined, null, {}, [], [row(self)], [row(peer), row(peer)], [row(peer), row(self)],
+      [{ userId: Number(peer) }], [{ userId: '9007199254740994' }], [null], [{}],
+      [{ userId: Long.fromString('9223372036854775808') }], [{ userId: { low: 1, high: 0.5 } }]]) {
+      it(`rejects missing/duplicate/extra/malformed member rows ${JSON.stringify(invalid)}`, async () => {
+        await rejectedResponse({ ...answer(), body: { ...answer().body, members: invalid } })
+      })
+    }
+    it('rejects a two-person response missing self', async () => {
+      const client = await ready()
+      mockGetMembersByIds.mockResolvedValueOnce(answer())
+      await expect(client.getSelectedMembersOnce(chatId, [self, peer])).rejects.toThrow('selected_member_ids_mismatch')
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+    for (const status of [-310, -1, undefined, null, '0', NaN]) {
+      it(`rejects invalid/nonzero packet status ${String(status)} without retry`, async () => {
+        await rejectedResponse({ ...answer(), statusCode: status })
+      })
+    }
+    for (const status of [null, '0', 'failure', false, {}, NaN]) {
+      it(`rejects malformed body status ${JSON.stringify(status)}`, async () => {
+        await rejectedResponse({ ...answer(), body: { ...answer().body, status } })
+      })
+    }
+    it('accepts signed-int64 maximum chat and adjacent member IDs without wrapping', async () => {
+      const client = await ready()
+      mockGetMembersByIds.mockResolvedValueOnce({ statusCode: 0,
+        body: { chatId: Long.fromString(self), status: 0, members: [row(peer), row(chatId)] } })
+      const members = await client.getSelectedMembersOnce(self, [peer, chatId])
+      expect(members.map((member) => member.user_id)).toEqual([peer, chatId])
+      const call = mockGetMembersByIds.mock.calls[0] as unknown as [Long, Long[]]
+      expect(call[0].toString()).toBe(self)
+      expect(call[1].map((id) => id.toString())).toEqual([peer, chatId])
+      client.close()
+    })
+    it('preserves provider rejection classification and body status', async () => {
+      const client = await ready()
+      mockGetMembersByIds.mockResolvedValueOnce({ ...answer(), body: { ...answer().body, status: -42 } })
+      await expect(client.getSelectedMembersOnce(chatId, [peer])).rejects.toMatchObject({
+        code: 'get_selected_members_failed', serverStatus: -42, responseStatusSource: 'body', responseFailureKind: 'provider_rejection',
+      })
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+    for (const change of ['invalidate', 'replace', 'close'] as const) {
+      it(`rejects late success after ${change} and never replays`, async () => {
+        const client = await ready()
+        let resolve!: (value: unknown) => void
+        mockGetMembersByIds.mockImplementationOnce(() => new Promise((r) => { resolve = r }))
+        const pending = client.getSelectedMembersOnce(chatId, [peer])
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+        if (change === 'close') client.close()
+        else {
+          mockOnClose.mock.calls.at(-1)?.[0]()
+          if (change === 'replace') await client.getChats({ resolveTitles: false })
+        }
+        resolve(answer())
+        await expect(pending).rejects.toThrow('selected_member_session_changed')
+        expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+        expect(mockLogin).toHaveBeenCalledTimes(change === 'replace' ? 2 : 1)
+        client.close()
+      })
+    }
+    it('propagates transport failure without reconnect or retry', async () => {
+      const client = await ready()
+      mockGetMembersByIds.mockImplementationOnce(async () => {
+        mockOnClose.mock.calls.at(-1)?.[0]()
+        throw new Error('synthetic transport failure')
+      })
+      await expect(client.getSelectedMembersOnce(chatId, [peer])).rejects.toMatchObject({
+        code: 'get_selected_members_failed', responseFailureKind: 'transient_or_unknown',
+      })
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      expect(mockGetMembersByIds).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+  })
+
   describe('getMembers / getMembersByIds', () => {
     it('returns formatted members from GETMEM with normalized fields', async () => {
       mockGetChannelInfo.mockResolvedValueOnce(memberChannelInfo(2)).mockResolvedValueOnce(memberChannelInfo(2))

@@ -366,7 +366,7 @@ function positiveSignedInt64String(value: unknown): string | null {
   return id > 0n && id <= MAX_SIGNED_INT64 ? normalized : null
 }
 
-function parsePositiveSignedInt64(value: string, field: 'peer' | 'chat' | 'link'): Long {
+function parsePositiveSignedInt64(value: string, field: 'peer' | 'chat' | 'link' | 'user'): Long {
   if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
     throw new KakaoTalkError(`Invalid ${field}Id: expected canonical positive int64`, `invalid_${field}_id`)
   }
@@ -2157,6 +2157,50 @@ export class KakaoTalkClient {
         })
       }
       throw error
+    }
+  }
+
+  /** Read exactly one selected peer, or self and peer, on the prepared session. Never acquire or replay. */
+  async getSelectedMembersOnce(chatId: string, userIds: string[]): Promise<KakaoMember[]> {
+    const cid = parsePositiveSignedInt64(chatId, 'chat')
+    if (!Array.isArray(userIds) || userIds.length < 1 || userIds.length > 2) {
+      throw new KakaoTalkError('selected_member_count_invalid', 'get_selected_members_failed')
+    }
+    const ids = Array.from(userIds, (id) => parsePositiveSignedInt64(id, 'user'))
+    const requested = new Set(ids.map(longToString))
+    if (requested.size !== ids.length) {
+      throw new KakaoTalkError('selected_member_ids_duplicate', 'get_selected_members_failed')
+    }
+    const state = this.state
+    const check = () => {
+      if (!state || this.closed || this.state !== state || this.admissionFailure) {
+        throw new KakaoTalkError('selected_member_session_changed', 'get_selected_members_failed')
+      }
+    }
+    check()
+    try {
+      const response = await state!.session.getMembersByIds(cid, ids)
+      check()
+      assertLocoOk(response, 'MEMBER')
+      if (response.body.status !== undefined && !Number.isSafeInteger(response.body.status)) {
+        throw new Error('selected_member_status_invalid')
+      }
+      if (positiveSignedInt64String(response.body.chatId) !== longToString(cid)) {
+        throw new Error('selected_member_chat_mismatch')
+      }
+      const exact = exactMemberRecords(response.body.members, 'MEMBER')
+      if (!sameIds(requested, exact.ids)) throw new Error('selected_member_ids_mismatch')
+      return exact.records.map((record) => {
+        const rawLink = record.pli
+        if (rawLink === undefined || rawLink === null || readStateId(rawLink) === '0') {
+          return formatMember({ ...record, pli: null })
+        }
+        const link = positiveSignedInt64String(rawLink)
+        if (link === null) throw new Error('selected_member_link_invalid')
+        return formatMember({ ...record, pli: parseLong(link) })
+      })
+    } catch (error) {
+      throw wrapError(error, 'get_selected_members_failed', { classifyResponseFailure: true })
     }
   }
 

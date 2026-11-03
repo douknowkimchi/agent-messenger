@@ -2513,6 +2513,85 @@ describe('KakaoTalkClient', () => {
     }
   })
 
+  describe('sendTextOnce on an already prepared session', () => {
+    async function prepared() {
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: '1', deviceUuid: 'device1' })
+      await client.acquireSession()
+      return client
+    }
+
+    it('sends one WRITE with an exact 64-bit room id and accepts its log id', async () => {
+      const client = await prepared()
+      mockSendMessage.mockResolvedValueOnce({ statusCode: 0, body: { logId: Long.fromString('9007199254740993'), sendAt: 1700000099 } })
+      await expect(client.sendTextOnce('9223372036854775807', 'synthetic one shot')).resolves.toMatchObject({
+        success: true, status_code: 0, chat_id: '9223372036854775807', log_id: '9007199254740993',
+      })
+      expect(mockSendMessage).toHaveBeenCalledTimes(1)
+      expect((mockSendMessage.mock.calls[0][0] as Long).toString()).toBe('9223372036854775807')
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      expect(mockEnterRoom).not.toHaveBeenCalled()
+      expect(mockMarkRead).not.toHaveBeenCalled()
+      client.close()
+    })
+
+    it('refuses a cold authenticated client before acquiring a session or writing', async () => {
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: '1', deviceUuid: 'device1' })
+      await expect(client.sendTextOnce('100', 'synthetic')).rejects.toMatchObject({ code: 'send_session_not_ready' })
+      expect(mockLogin).not.toHaveBeenCalled()
+      expect(mockSendMessage).not.toHaveBeenCalled()
+      client.close()
+    })
+
+    it('keeps an explicit provider refusal distinct from a lost response', async () => {
+      const client = await prepared()
+      mockSendMessage.mockResolvedValueOnce({ statusCode: -500, body: {} })
+      await expect(client.sendTextOnce('100', 'synthetic')).resolves.toMatchObject({ success: false, status_code: -500 })
+      expect(mockSendMessage).toHaveBeenCalledTimes(1)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    for (const [label, response] of [
+      ['connection-close sentinel', { statusCode: -1, body: { error: 'connection closed' } }],
+      ['missing status', { body: {} }],
+      ['missing identity', { statusCode: 0, body: {} }],
+      ['wrong room', { statusCode: 0, body: { logId: makeLong(42), chatId: makeLong(200) } }],
+    ]) {
+      it(`does not call a ${label} a provider rejection or replay the WRITE`, async () => {
+        const client = await prepared()
+        mockSendMessage.mockResolvedValueOnce(response)
+        await expect(client.sendTextOnce('100', 'synthetic')).rejects.toMatchObject({ code: 'send_message_failed' })
+        expect(mockSendMessage).toHaveBeenCalledTimes(1)
+        expect(mockLogin).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+    }
+
+    it('does not reconnect or replay when the captured session closes after WRITE', async () => {
+      const client = await prepared()
+      mockSendMessage.mockImplementationOnce(async () => {
+        const closeHandler = mockOnClose.mock.calls.at(-1)?.[0] as (() => void) | undefined
+        closeHandler?.()
+        throw new Error('Synthetic socket closed after WRITE')
+      })
+      await expect(client.sendTextOnce('100', 'synthetic')).rejects.toMatchObject({ code: 'send_message_failed' })
+      await expect(client.sendTextOnce('100', 'next explicit attempt on closed session')).rejects.toMatchObject({ code: 'send_session_not_ready' })
+      expect(mockSendMessage).toHaveBeenCalledTimes(1)
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    for (const room of ['', '0', '-1', '01', '1.0', '9223372036854775808']) {
+      it(`rejects invalid room ${JSON.stringify(room)} before WRITE`, async () => {
+        const client = await prepared()
+        await expect(client.sendTextOnce(room, 'synthetic')).rejects.toThrow()
+        expect(mockSendMessage).not.toHaveBeenCalled()
+        expect(mockLogin).toHaveBeenCalledTimes(1)
+        client.close()
+      })
+    }
+  })
+
   describe('sendMessage', () => {
     it('returns send result on success', async () => {
       mockSendMessage.mockResolvedValueOnce({

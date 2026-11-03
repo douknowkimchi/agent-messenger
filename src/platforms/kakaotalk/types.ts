@@ -145,6 +145,8 @@ export interface KakaoMember {
   /** Open-chat-only fields below; `null` for normal chats. */
   open_token: number | null
   open_profile_link_id: string | null
+  /** Explicit OpenLinkChannelUserStruct.ptp only; omission is unknown, never MAIN. */
+  open_profile_type?: number
   /** OpenChannelUserPerm bitfield: 1=OWNER, 2=NONE, 4=MANAGER, 8=BOT. Forward-compatible with future values. */
   open_permission: number | null
 }
@@ -165,7 +167,8 @@ export interface KakaoMemberSnapshot {
 
 /** The signed-in account's profile in one open chat, as its CHATONROOM olu named it. */
 export interface KakaoOpenSelfProfile {
-  /** OpenProfileType: 1=MAIN, 2=KAKAO_ANON, 4/8 other, 16=OPEN_PROFILE. */
+  /** Pinned node-kakao OpenProfileType: 1=MAIN, 2=KAKAO_ANON, 4=KAKAO_ANON_2,
+   * 8=UNKNOWN_1, 16=OPEN_PROFILE. Display classification grants no JOIN authority. */
   profile_type: number
   /** Canonical positive int64 profile link; null when olu carries none. */
   link_id: string | null
@@ -413,6 +416,7 @@ export const KakaoMemberSchema = z.object({
   user_type: z.number().nullable(),
   open_token: z.number().nullable(),
   open_profile_link_id: z.string().nullable(),
+  open_profile_type: z.number().int().positive().optional(),
   open_permission: z.number().nullable(),
 })
 

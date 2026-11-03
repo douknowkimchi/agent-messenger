@@ -863,6 +863,8 @@ function formatMember(member: Record<string, unknown>): KakaoMember {
     open_token: nullableNumber(member.opt),
     open_profile_link_id: isNonZeroLong(member.pli) ? longToString(member.pli) : null,
     open_permission: nullableNumber(member.mt),
+    ...(typeof member.ptp === 'number' && Number.isSafeInteger(member.ptp) && member.ptp > 0
+      ? { open_profile_type: member.ptp } : {}),
   }
 }
 
@@ -979,7 +981,7 @@ function memberRecordError(
 function openLinkUserAsMember(olu: Record<string, unknown>): Record<string, unknown> {
   const member: Record<string, unknown> = { userId: olu.userId }
   if (typeof olu.nn === 'string') member.nickName = olu.nn
-  for (const [from, to] of [['pi', 'pi'], ['fpi', 'fpi'], ['opi', 'opi'], ['opt', 'opt'], ['pli', 'pli'], ['lmt', 'mt']]) {
+  for (const [from, to] of [['pi', 'pi'], ['fpi', 'fpi'], ['opi', 'opi'], ['opt', 'opt'], ['pli', 'pli'], ['lmt', 'mt'], ['ptp', 'ptp']]) {
     if (olu[from] !== undefined) member[to] = olu[from]
   }
   return member

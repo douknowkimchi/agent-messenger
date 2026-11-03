@@ -2198,6 +2198,33 @@ export class KakaoTalkClient {
     })
   }
 
+  /** One plain WRITE on the already connected session. Never acquire or replay on a replacement. */
+  async sendTextOnce(chatId: string, text: string) {
+    const target = parsePositiveSignedInt64(chatId, 'chat')
+    if (!this.state || this.closed || this.admissionFailure) {
+      throw new KakaoTalkError('No prepared session for WRITE', 'send_session_not_ready')
+    }
+    try {
+      const response = await this.state.session.sendMessage(target, text)
+      if (!Number.isSafeInteger(response.statusCode) ||
+          (response.body?.status !== undefined && !Number.isSafeInteger(response.body.status))) {
+        throw new Error('WRITE acknowledgement status invalid')
+      }
+      assertLocoOk(response, 'WRITE')
+      const logId = positiveSignedInt64String(response.body.logId)
+      if (logId === null || (response.body.chatId !== undefined &&
+          positiveSignedInt64String(response.body.chatId) !== chatId)) {
+        throw new Error('WRITE acknowledgement identity invalid')
+      }
+      return { success: true, status_code: 0, chat_id: chatId, log_id: logId }
+    } catch (error) {
+      if (error instanceof LocoResponseError && error.responseFailureKind === 'provider_rejection') {
+        return { success: false, status_code: error.serverStatus }
+      }
+      throw wrapError(error, 'send_message_failed', { classifyResponseFailure: true })
+    }
+  }
+
   async sendTyping(chatId: string, opts?: { linkId?: string }): Promise<KakaoTypingResult> {
     const parsedChatId = parseChatId(chatId)
     const parsedLinkId = opts?.linkId !== undefined ? parseLinkId(opts.linkId) : undefined

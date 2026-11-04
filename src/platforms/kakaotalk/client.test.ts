@@ -2276,7 +2276,7 @@ describe('KakaoTalkClient', () => {
       })
       const client = await login()
       await expect(client.getOpenLink(link)).resolves.toEqual({
-        link_id: link, link_type: 1, active: true, owner_user_id: owner.toString(),
+        link_id: link, link_type: 1, active: true, owner_user_id: owner.toString(), any_profile_allowed: null,
       })
       const [ids] = mockGetOpenLinkInfo.mock.calls[0] as [Long[]]
       expect(ids.map(String)).toEqual([link])

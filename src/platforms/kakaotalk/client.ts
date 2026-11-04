@@ -861,7 +861,34 @@ function assertLocoOk(response: LocoPacket, command: string): void {
   }
 }
 
+// Inverse only of node-kakao 8512e469 OpenUploadApiClient's three link-image
+// URL builders. No arbitrary display URL, upload, decoding or guessed default.
+function nicknameProfile(record: Record<string, unknown>, nickname: unknown) {
+  if (record.ptp !== 2 || !validNickname(nickname)) return undefined
+  const images = [record.pi, record.fpi, record.opi,
+    record.profileImageUrl, record.fullProfileImageUrl, record.originalProfileImageUrl]
+    .filter(value => value !== undefined && value !== null && value !== '')
+  if (images.length === 0) return undefined
+  const keys = images.map(value => typeof value === 'string'
+    ? /^https?:\/\/open\.kakaocdn\.net\/dn\/([A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*)\/img(?:_s|_l)?\.jpg$/.exec(value)?.[1]
+    : undefined)
+  const key = keys[0]
+  if (!key || key.length > 1024 || keys.some(value => value !== key)) return undefined
+  return { nickname, profile_path: key }
+}
+
+function validNickname(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= 80 &&
+    !/[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(value)
+}
+
+function anyProfileAllowed(value: unknown): boolean | null {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return null
+  return (BigInt(value) & 32n) !== 0n
+}
+
 function formatMember(member: Record<string, unknown>): KakaoMember {
+  const anonymous = nicknameProfile(member, member.nickName)
   return {
     user_id: longToString(member.userId),
     nickname: typeof member.nickName === 'string' ? member.nickName : '',
@@ -876,6 +903,7 @@ function formatMember(member: Record<string, unknown>): KakaoMember {
     open_permission: nullableNumber(member.mt),
     ...(typeof member.ptp === 'number' && Number.isSafeInteger(member.ptp) && member.ptp > 0
       ? { open_profile_type: member.ptp } : {}),
+    ...(anonymous ? { open_nickname_profile: anonymous } : {}),
   }
 }
 
@@ -2679,7 +2707,8 @@ export class KakaoTalkClient {
       const owner = link.olu && typeof link.olu === 'object' && !Array.isArray(link.olu)
         ? memberIdKey(link.olu as Record<string, unknown>) : null
       if (owner === null) throw new OpenLinkResponseError('owner_invalid', 'INFOLINK response invalid owner')
-      return { link_id: linkId, link_type: link.lt, active: link.ac, owner_user_id: owner }
+      return { link_id: linkId, link_type: link.lt, active: link.ac, owner_user_id: owner,
+        any_profile_allowed: anyProfileAllowed(link.pv) }
     } catch (error) {
       throw wrapError(error, 'get_open_link_failed', { classifyResponseFailure: true })
     }
@@ -2698,11 +2727,15 @@ export class KakaoTalkClient {
    */
   async joinOpenDirectOnce(linkId: string, profile: KakaoOpenJoinProfile): Promise<KakaoJoinOpenDirectResult> {
     const parsedLinkId = parsePositiveSignedInt64(linkId, 'link')
-    let wire: { ptp: 1 } | { ptp: 16; pli: Long }
+    let wire: { ptp: 1 } | { ptp: 16; pli: Long } | { ptp: 2; nn: string; pp: string }
     if (profile?.kind === 'main') {
       wire = { ptp: 1 }
     } else if (profile?.kind === 'open_profile') {
       wire = { ptp: 16, pli: parsePositiveSignedInt64(profile.link_id, 'link') }
+    } else if (profile?.kind === 'anonymous' && validNickname(profile.nickname) &&
+      typeof profile.profile_path === 'string' && profile.profile_path.length <= 1024 &&
+      /^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(profile.profile_path)) {
+      wire = { ptp: 2, nn: profile.nickname, pp: profile.profile_path }
     } else {
       throw new KakaoTalkError('Invalid open join profile', 'invalid_open_profile')
     }

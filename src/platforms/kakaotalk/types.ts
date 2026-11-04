@@ -147,6 +147,8 @@ export interface KakaoMember {
   open_profile_link_id: string | null
   /** Explicit OpenLinkChannelUserStruct.ptp only; omission is unknown, never MAIN. */
   open_profile_type?: number
+  /** Observed ptp=2 nickname and a proven existing open-CDN access key. RAM only. */
+  open_nickname_profile?: { nickname: string; profile_path: string }
   /** OpenChannelUserPerm bitfield: 1=OWNER, 2=NONE, 4=MANAGER, 8=BOT. Forward-compatible with future values. */
   open_permission: number | null
 }
@@ -182,10 +184,13 @@ export interface KakaoOpenLink {
   active: boolean
   /** The link owner's user id (ol.olu.userId), exact decimal string. */
   owner_user_id: string
+  /** null means the provider did not supply a usable privilege mask. */
+  any_profile_allowed: boolean | null
 }
 
 /** The profile the signed-in account joins an open profile link with. */
 export type KakaoOpenJoinProfile = { kind: 'main' } | { kind: 'open_profile'; link_id: string }
+  | { kind: 'anonymous'; nickname: string; profile_path: string }
 
 export type KakaoJoinOpenDirectResult =
   | {
@@ -417,6 +422,7 @@ export const KakaoMemberSchema = z.object({
   open_token: z.number().nullable(),
   open_profile_link_id: z.string().nullable(),
   open_profile_type: z.number().int().positive().optional(),
+  open_nickname_profile: z.object({ nickname: z.string(), profile_path: z.string() }).optional(),
   open_permission: z.number().nullable(),
 })
 

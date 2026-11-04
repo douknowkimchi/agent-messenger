@@ -69,12 +69,12 @@ export async function sendCreateDirectChatPacket(
 // Wire shape from node-kakao 8512e469 (MIT, storycraft)
 // TalkOpenChannelSession.joinChannel and OpenLinkProfile.serializeLinkProfile:
 // `{ li, ref: 'EW:', ptp }` plus `pli` for an open profile (ptp 16); the main
-// profile is `{ ptp: 1 }`. The anonymous profile (ptp 2, nn, pp path) and the
-// passcode token are not built here. This helper only owns the packet; the
+// profile is `{ ptp: 1 }`; a proven nickname resource uses ptp 2, nn, pp.
+// No upload or passcode token is built here. This helper only owns the packet; the
 // public client method dispatches it at most once.
 export const JOIN_OPEN_LINK_METHOD = 'JOINLINK'
 
-export type OpenJoinProfileWire = { ptp: 1 } | { ptp: 16; pli: Long }
+export type OpenJoinProfileWire = { ptp: 1 } | { ptp: 16; pli: Long } | { ptp: 2; nn: string; pp: string }
 
 export function buildJoinOpenLinkBody(linkId: Long, profile: OpenJoinProfileWire): Record<string, unknown> {
   return { li: linkId, ref: 'EW:', ...profile }

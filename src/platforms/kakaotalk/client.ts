@@ -193,6 +193,17 @@ export class KakaoTalkError extends Error {
   }
 }
 
+// Keep parsing failures distinct from a failed INFOLINK call, without
+// deriving diagnostics from an exception message or carrying a response row.
+class OpenLinkResponseError extends KakaoTalkError {
+  constructor(
+    readonly openLinkFailureReason: 'response_invalid' | 'link_id_invalid' | 'link_id_mismatch' | 'link_type_invalid' | 'activation_invalid' | 'owner_invalid',
+    message: string,
+  ) {
+    super(message, 'get_open_link_failed', { responseFailureKind: 'transient_or_unknown' })
+  }
+}
+
 /** An exact member list refused with its aggregate record shape. */
 class MemberRecordError extends Error {
   constructor(
@@ -2650,17 +2661,24 @@ export class KakaoTalkClient {
     const session = await this.acquireSession()
     try {
       const response = await session.getOpenLinkInfo([parsedLinkId])
+      // A successful packet without an object body was received, not lost.
+      // Keep non-zero packet/provider statuses in the existing status owner.
+      if (response.statusCode === 0 &&
+        (!response.body || typeof response.body !== 'object' || Array.isArray(response.body))) {
+        throw new OpenLinkResponseError('response_invalid', 'INFOLINK response invalid body')
+      }
       assertLocoOk(response, 'INFOLINK')
       const ols = response.body.ols
-      if (!Array.isArray(ols) || ols.length !== 1) throw new Error('INFOLINK response invalid: not exactly one link')
+      if (!Array.isArray(ols) || ols.length !== 1) throw new OpenLinkResponseError('response_invalid', 'INFOLINK response invalid: not exactly one link')
       const link = ols[0] as Record<string, unknown> | null
-      if (!link || typeof link !== 'object' || Array.isArray(link)) throw new Error('INFOLINK response invalid link')
-      if (positiveSignedInt64String(link.li) !== linkId) throw new Error('INFOLINK response invalid link id')
-      if (typeof link.lt !== 'number' || !Number.isSafeInteger(link.lt)) throw new Error('INFOLINK response invalid type')
-      if (typeof link.ac !== 'boolean') throw new Error('INFOLINK response invalid activation')
+      if (!link || typeof link !== 'object' || Array.isArray(link)) throw new OpenLinkResponseError('response_invalid', 'INFOLINK response invalid link')
+      const actualId = positiveSignedInt64String(link.li)
+      if (actualId !== linkId) throw new OpenLinkResponseError(actualId === null ? 'link_id_invalid' : 'link_id_mismatch', 'INFOLINK response invalid link id')
+      if (typeof link.lt !== 'number' || !Number.isSafeInteger(link.lt)) throw new OpenLinkResponseError('link_type_invalid', 'INFOLINK response invalid type')
+      if (typeof link.ac !== 'boolean') throw new OpenLinkResponseError('activation_invalid', 'INFOLINK response invalid activation')
       const owner = link.olu && typeof link.olu === 'object' && !Array.isArray(link.olu)
         ? memberIdKey(link.olu as Record<string, unknown>) : null
-      if (owner === null) throw new Error('INFOLINK response invalid owner')
+      if (owner === null) throw new OpenLinkResponseError('owner_invalid', 'INFOLINK response invalid owner')
       return { link_id: linkId, link_type: link.lt, active: link.ac, owner_user_id: owner }
     } catch (error) {
       throw wrapError(error, 'get_open_link_failed', { classifyResponseFailure: true })

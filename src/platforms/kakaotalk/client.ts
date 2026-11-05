@@ -1786,6 +1786,8 @@ export class KakaoTalkClient {
       const seenLogIds = new Set<string>()
       let cur = cursor ?? Long.fromNumber(0)
       let bulkStopped = false
+      // MCHATLOGS answered nothing from the room's start (no prefix received).
+      let startAnsweredEmpty = false
 
       try {
         for (let page = 0; page < MAX_PAGES; page++) {
@@ -1796,6 +1798,7 @@ export class KakaoTalkClient {
           if (batch.length === 0) {
             // Empty alone does not prove a current suffix. Keep the validated
             // prefix and check the fresh room target before returning it.
+            startAnsweredEmpty = cursor === undefined && page === 0
             bulkStopped = true
             break
           }
@@ -1859,7 +1862,17 @@ export class KakaoTalkClient {
         this.assertHistorySession(session)
         assertLocoOk(response, 'SYNCMSG')
         const batch = validatedHistoryRows(response.body.chatLogs ?? [], chatId)
-        if (batch.length === 0) throw new Error('message_history_unavailable')
+        if (batch.length === 0) {
+          // The room holds nothing this account can read: MCHATLOGS answered
+          // nothing from the start and SYNCMSG ends the whole interval to the
+          // fresh target with isOK and no record (KiwiTalk sync_chat_stream).
+          // Any received record, a cursor, or an empty answer without isOK
+          // proves no empty room and stays unavailable.
+          if (page === 0 && startAnsweredEmpty && allMessages.length === 0 && response.body.isOK === true) {
+            return []
+          }
+          throw new Error('message_history_unavailable')
+        }
 
         for (const log of batch) {
           const lid = longToString(log.logId)

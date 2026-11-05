@@ -883,8 +883,14 @@ function validNickname(value: unknown): value is string {
 }
 
 function anyProfileAllowed(value: unknown): boolean | null {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return null
-  return (BigInt(value) & 32n) !== 0n
+  // INFOLINK pv is BSON int64. The packet decoder promotes small values to
+  // numbers but keeps large masks as Long; never flatten those to Number.
+  if (typeof value !== 'number' && (!value || typeof value !== 'object' || Array.isArray(value))) return null
+  const normalized = readStateId(value)
+  if (normalized === null) return null
+  const mask = BigInt(normalized)
+  if (mask > MAX_SIGNED_INT64) return null
+  return (mask & 32n) !== 0n
 }
 
 function formatMember(member: Record<string, unknown>): KakaoMember {

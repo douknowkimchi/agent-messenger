@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { Long } from 'bson'
+import { encodePacket, decodePacket } from '../dist/src/platforms/kakaotalk/protocol/packet.js'
 import { KakaoTalkClient } from '../dist/src/platforms/kakaotalk/client.js'
 import { buildJoinOpenLinkBody } from '../dist/src/platforms/kakaotalk/protocol/session.js'
 import { KakaoMemberSchema } from '../dist/src/platforms/kakaotalk/types.js'
@@ -75,3 +77,51 @@ test('nickname packet preserves exact nn/pp and response loss never repeats JOIN
   }
   assert.equal(calls.length,1)
 })
+
+// node-kakao 8512e469 defines OpenLinkStruct.pv as BSON Long. Exercise the
+// SDK packet decoder, not a numeric-only mock: large masks remain Long.
+for (const [label, mask, expected, decodedKind] of [
+  ['small allowed', 32n, true, 'number'],
+  ['small restricted', 0n, false, 'number'],
+  ['large allowed', (1n << 60n) | 32n, true, 'object'],
+  ['large restricted', 1n << 60n, false, 'object'],
+  ['max positive signed', (1n << 63n) - 1n, true, 'object'],
+  ['negative', -1n, null, 'number'],
+]) {
+  test(`INFOLINK wire privilege ${label} keeps exact permission`, async () => {
+    let reads = 0
+    const response = decodePacket(encodePacket({ packetId: 1, statusCode: 0,
+      method: 'INFOLINK', bodyType: 0,
+      body: { ols: [{ li: Long.fromInt(7), lt: 1, ac: true,
+        pv: Long.fromString(mask.toString()), olu: { userId: Long.fromInt(2) } }] },
+    }))
+    assert.ok(response)
+    assert.equal(typeof response.packet.body.ols[0].pv, decodedKind)
+    const client = sdk({ async getOpenLinkInfo() { reads++; return response.packet } })
+    assert.equal((await client.getOpenLink('7')).any_profile_allowed, expected)
+    assert.equal(reads, 1)
+  })
+}
+
+for (const [label, pv, expected] of [
+  ['Long allowed', Long.fromInt(32), true],
+  ['Long zero', Long.ZERO, false],
+  ['Long restricted', Long.fromInt(64), false],
+  ['validated words', { low: 32, high: 268435456 }, true],
+  ['signed low word', { low: -1, high: 0 }, true],
+  ['negative Long', Long.NEG_ONE, null],
+  ['unsigned out of signed range', Long.fromString('9223372036854775840', true), null],
+  ['fractional word', { low: 32.5, high: 0 }, null],
+  ['oversized word', { low: 4294967328, high: 0 }, null],
+  ['string word', { low: '32', high: 0 }, null],
+  ['missing word', { low: 32 }, null],
+  ['array with words', Object.assign([], { low: 32, high: 0 }), null],
+  ['numeric text', '32', null],
+  ['raw bigint', 32n, null],
+]) {
+  test(`INFOLINK decoded privilege ${label} is validated without coercion`, async () => {
+    const client = sdk({ async getOpenLinkInfo() { return { statusCode: 0,
+      body: { ols: [{ li: long(7), lt: 1, ac: true, pv, olu: { userId: long(2) } }] } } } })
+    assert.equal((await client.getOpenLink('7')).any_profile_allowed, expected)
+  })
+}

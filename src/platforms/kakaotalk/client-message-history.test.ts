@@ -152,3 +152,100 @@ describe('recent history proof', () => {
     expect(login).toHaveBeenCalledTimes(2)
   })
 })
+
+
+describe('history selection and page truth', () => {
+  for (const sameSecond of [true, false]) {
+    it(`selects recent N by native log order before truncation (same second=${sameSecond})`, async () => {
+      const rows = [log(3), log(1), log(2)].map(value => ({
+        ...value, sendAt: sameSecond ? 100 : 100 - Number(value.logId.toString()),
+      }))
+      mchat.mockResolvedValueOnce(packet({ chatLogs: rows, eof: true }))
+      const result = await (await client()).getMessages('100', { count: 2 })
+      expect(result.map(value => value.log_id)).toEqual(['2', '3'])
+      expect(mchat).toHaveBeenCalledTimes(1)
+      expect(sync).not.toHaveBeenCalled()
+    })
+  }
+
+  it('preserves recent log selection above JavaScript safe integer precision', async () => {
+    const ids = ['9007199254740995', '9007199254740993', '9007199254740994']
+    mchat.mockResolvedValueOnce(packet({ chatLogs: ids.map(id => ({
+      ...log(1), logId: Long.fromString(id), sendAt: 100, message: `synthetic-${id}`,
+    })), eof: true }))
+    const result = await (await client()).getMessages('100', { count: 2 })
+    expect(result.map(value => value.log_id)).toEqual(['9007199254740994', '9007199254740995'])
+    expect(result.map(value => value.message)).toEqual(['synthetic-9007199254740994', 'synthetic-9007199254740995'])
+  })
+
+  it('selects the same native recent suffix through the SYNCMSG fallback', async () => {
+    sync.mockResolvedValueOnce(packet({ chatLogs: [log(3), log(1), log(2)].map(value => ({ ...value, sendAt: 100 })), isOK: true }))
+    const result = await (await client()).getMessages('100', { count: 2 })
+    expect(result.map(value => value.log_id)).toEqual(['2', '3'])
+    expect(mchat).toHaveBeenCalledTimes(1)
+    expect(info).toHaveBeenCalledTimes(1)
+    expect(sync).toHaveBeenCalledTimes(1)
+  })
+
+  for (const rows of [[], [log(2)], [log(1)], [log(3, 200)]]) {
+    it(`rejects a terminal page before the fresh watermark (${rows.map(value => String(value.logId)).join(',') || 'empty'}, room=${rows[0]?.chatId ?? 'none'})`, async () => {
+      sync.mockResolvedValueOnce(packet({ chatLogs: rows, isOK: true }))
+      await expect((await client()).getMessagePage('100', { from: '1', count: 2 }))
+        .rejects.toMatchObject({ code: 'get_message_page_failed' })
+      expect(mchat).toHaveBeenCalledTimes(1)
+      expect(info).toHaveBeenCalledTimes(1)
+      expect(sync).toHaveBeenCalledTimes(1)
+      expect(login).toHaveBeenCalledTimes(1)
+    })
+  }
+
+  for (const lastLogId of [Long.ZERO, 0, '0']) {
+    it(`proves an empty forward page from a validated zero (${typeof lastLogId})`, async () => {
+      info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId } }))
+      expect(await (await client()).getMessagePage('100'))
+        .toEqual({ messages: [], next_cursor: null, complete: true })
+      expect(sync).not.toHaveBeenCalled()
+    })
+  }
+
+  for (const lastLogId of [3, '3']) {
+    it(`uses the existing exact watermark reader for a nonzero ${typeof lastLogId}`, async () => {
+      info.mockResolvedValueOnce(packet({ chatInfo: { chatId: 100, lastLogId } }))
+      const page = await (await client()).getMessagePage('100', { from: '2' })
+      expect(page.messages.map(value => value.log_id)).toEqual(['3'])
+      expect(page.complete).toBe(true)
+    })
+  }
+
+  for (const chatInfo of [
+    { chatId: 100, lastLogId: Long.ZERO, left: true },
+    { chatId: 200, lastLogId: Long.ZERO },
+    { chatId: 100 },
+    { chatId: 100, lastLogId: -1 },
+    { chatId: 100, lastLogId: Number.MAX_SAFE_INTEGER + 1 },
+    { chatId: 100, lastLogId: '18446744073709551616' },
+  ]) {
+    it(`rejects an invalid forward watermark or room: ${JSON.stringify(chatInfo)}`, async () => {
+      info.mockResolvedValueOnce(packet({ chatInfo }))
+      await expect((await client()).getMessagePage('100'))
+        .rejects.toMatchObject({ code: 'get_message_page_failed' })
+      expect(sync).not.toHaveBeenCalled()
+    })
+  }
+
+  it('keeps a progressing nonterminal page and does not claim a complete suffix', async () => {
+    sync.mockResolvedValueOnce(packet({ chatLogs: [log(2)], isOK: false }))
+    const page = await (await client()).getMessagePage('100', { from: '1' })
+    expect(page.messages.map(value => value.log_id)).toEqual(['2'])
+    expect(page.next_cursor).toBe('2')
+    expect(page.complete).toBe(false)
+  })
+
+  it('keeps truncation lossless even when the provider reached the watermark', async () => {
+    sync.mockResolvedValueOnce(packet({ chatLogs: [log(3), log(2)], isOK: true }))
+    const page = await (await client()).getMessagePage('100', { from: '1', count: 1 })
+    expect(page.messages.map(value => value.log_id)).toEqual(['2'])
+    expect(page.next_cursor).toBe('2')
+    expect(page.complete).toBe(false)
+  })
+})

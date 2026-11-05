@@ -2,8 +2,9 @@
 
 This KakaoTalk protocol and Android authentication implementation was written
 from scratch for agent-messenger. The protocol knowledge used to build it comes
-from the following open-source projects and their documentation. No code was
-copied from these projects.
+from the following open-source projects and their documentation. The original protocol implementation did not copy code from these projects.
+The later, specifically identified KiwiTalk history behavior adaptation below
+is an exception; it does not replace the original authentication or transport.
 
 ---
 
@@ -64,3 +65,39 @@ behavior only; no source code was copied or adapted.
 
 The foundational reverse engineering of the LOCO protocol that all subsequent
 implementations are based on.
+
+
+---
+
+## KiwiTalk incremental history behavior adaptation (2026-10-29)
+
+- Source: https://github.com/dlwltkd/kiwitalk
+- Exact commit: `912528b6407a02a1f9b17cbc6fa3331497e6cabc`
+- File: `backend/crates/headless-talk/src/updater/chat.rs`
+- Git blob: `b58ce5d175d703af5e334b5aa0529cf4f1c3a5f8`
+- License: Apache-2.0; original license and NOTICE are preserved under
+  `src/vendor/kiwitalk-history/` and copied by the existing postbuild vendor step.
+- Original project: KiwiTalk/KiwiTalk; authors: KiwiTalk contributors;
+  revival-fork maintainer: dlwltkd. The original NOTICE remains authoritative.
+
+Disposition: **BEHAVIOR_PORT**. The existing TypeScript `getMessages` and
+`validatedHistoryRows` adapt the donor's `apply_sync_page`/`update_forward`
+page-admission and monotonic-progress rules. The corresponding empty, overlap,
+terminal-gap and wrong-room regression scenarios are adapted in
+`client-message-history.test.ts`. These are modified adaptations, not a verbatim
+copy of the Rust runtime or a claim that the donor was executed here.
+
+Deliberate differences: accepted progress lasts only for the current SDK call
+in RAM; no SQLite, disk checkpoint, cross-call cache, new login, room entry,
+GETMSGS recovery, or native read acknowledgement was imported. Existing eligible
+same-session MCHATLOGS-to-SYNCMSG fallback and existing page budgets are retained.
+Explicit provider denial, invalid page and no-progress errors stop instead of
+being recast as permission to try another protocol. An empty bulk tail requires
+the existing fresh CHATINFO target check before its retained prefix can be
+reported as current. Original native-ID, formatting, session and transport
+owners are reused. This does not establish Android/OpenChat live compatibility
+or the absence of SYNCMSG read effects.
+
+Successful omitted/null bulk chatLogs are normalized to an empty collection,
+as in the pinned Android response model. They still require the existing fresh
+target check and never erase a validated prefix or normalize provider refusal.

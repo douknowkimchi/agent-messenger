@@ -52,7 +52,7 @@ describe('recent history proof', () => {
       const result = await (await client()).getMessages('100', { count: 2 })
       expect(result.map(value => value.log_id)).toEqual(['3'])
       expect(info).toHaveBeenCalledTimes(1)
-      expect(sync.mock.calls[0]?.map(value => String(value))).toEqual(['100', '80', '0', '3'])
+      expect(sync.mock.calls[0]?.map(value => String(value))).toEqual(['100', '0', '0', '3'])
       expect(login).toHaveBeenCalledTimes(1)
     })
   }
@@ -143,13 +143,15 @@ describe('recent history proof', () => {
     expect(sync).toHaveBeenCalledTimes(50)
   })
 
-  it('retains the existing single replacement when the session closes during history', async () => {
+  it('does not replay history when the acquired session closes', async () => {
     mchat.mockImplementationOnce(async () => {
       onClose?.()
       throw new Error('synthetic close')
     })
-    expect((await (await client()).getMessages('100')).map(value => value.log_id)).toEqual(['3'])
-    expect(login).toHaveBeenCalledTimes(2)
+    await expect((await client()).getMessages('100')).rejects.toMatchObject({ code: 'get_messages_failed' })
+    expect(login).toHaveBeenCalledTimes(1)
+    expect(info).not.toHaveBeenCalled()
+    expect(sync).not.toHaveBeenCalled()
   })
 })
 

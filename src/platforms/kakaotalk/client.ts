@@ -499,8 +499,9 @@ function matchesSearch(chat: ChatData, term: string): boolean {
 
 function findMaxLogId(logs: Array<Record<string, unknown>>, field: string): Long | null {
   return logs.reduce<Long | null>((max, log) => {
-    const current = bsonToLong(log[field])
-    if (!current) return max
+    const id = readStateId(log[field])
+    if (id === null) return max
+    const current = Long.fromString(id, true)
     return !max || current.greaterThan(max) ? current : max
   }, null)
 }
@@ -1444,6 +1445,12 @@ export class KakaoTalkClient {
     }
   }
 
+  private assertHistorySession(session: LocoSession): void {
+    if (this.closed || this.state?.session !== session) {
+      throw new Error('message_history_session_changed')
+    }
+  }
+
   /**
    * Fetch one forward-only, lossless history page after `from`.
    *
@@ -1460,121 +1467,81 @@ export class KakaoTalkClient {
     const normalizedChatId = longToString(parsedChatId)
     const cursor = options?.from ? parseLogId(options.from) : Long.fromNumber(0)
 
-    return this.executeWithReconnect(async ({ session }) => {
-      try {
-        const response = await session.getChatLogs([parsedChatId], [cursor])
-        assertLocoOk(response, 'MCHATLOGS')
-        const batch = ((response.body.chatLogs ?? []) as Array<Record<string, unknown>>).filter(
-          (log) => longToString(log.chatId) === normalizedChatId,
-        )
+    const session = await this.acquireSession()
+    try {
+      this.assertHistorySession(session)
+      const response = await session.getChatLogs([parsedChatId], [cursor])
+      this.assertHistorySession(session)
+      assertLocoOk(response, 'MCHATLOGS')
+      const batch = ((response.body.chatLogs ?? []) as Array<Record<string, unknown>>).filter(
+        (log) => longToString(log.chatId) === normalizedChatId,
+      )
 
-        if (batch.length > 0) {
-          return buildMessagePage(batch, count, cursor, response.body.eof === true, normalizedChatId, this.nameCache)
-        }
-
-        // CHATINFO is read-only and supplies a fresh lastLogId even for rooms
-        // absent from the login snapshot. This avoids CHATONROOM, which can
-        // advance server-side unread state.
-        const chatInfoResponse = await session.getChannelInfo(parsedChatId)
-        assertLocoOk(chatInfoResponse, 'CHATINFO')
-        const maxLogId = extractChannelMaxLogId(chatInfoResponse.body as Record<string, unknown>, normalizedChatId)
-        if (maxLogId.lessThanOrEqual(cursor.toUnsigned())) {
-          return { messages: [], next_cursor: null, complete: true }
-        }
-
-        const syncResponse = await session.syncMessages(parsedChatId, Math.min(count, 80), cursor, maxLogId)
-        assertLocoOk(syncResponse, 'SYNCMSG')
-        const syncBatch = ((syncResponse.body.chatLogs ?? []) as Array<Record<string, unknown>>).filter(
-          (log) => longToString(log.chatId) === normalizedChatId,
-        )
-        const maxReturned = findMaxLogId(syncBatch, 'logId')
-        const protocolComplete = maxReturned !== null && maxReturned.toUnsigned().greaterThanOrEqual(maxLogId)
-        // Match recent-history proof: an EOF flag cannot make an incomplete
-        // interval a terminal suffix for downstream readers and RAM caches.
-        if (!protocolComplete && syncResponse.body.isOK === true) {
-          throw new Error('message_history_incomplete')
-        }
-
-        return buildMessagePage(syncBatch, count, cursor, protocolComplete, normalizedChatId, this.nameCache)
-      } catch (error) {
-        throw wrapError(error, 'get_message_page_failed')
+      if (batch.length > 0) {
+        return buildMessagePage(batch, count, cursor, response.body.eof === true, normalizedChatId, this.nameCache)
       }
-    })
+
+      // CHATINFO is read-only and supplies a fresh lastLogId even for rooms
+      // absent from the login snapshot. This avoids CHATONROOM, which can
+      // advance server-side unread state.
+      const chatInfoResponse = await session.getChannelInfo(parsedChatId)
+      this.assertHistorySession(session)
+      assertLocoOk(chatInfoResponse, 'CHATINFO')
+      const maxLogId = extractChannelMaxLogId(chatInfoResponse.body as Record<string, unknown>, normalizedChatId)
+      if (maxLogId.lessThanOrEqual(cursor.toUnsigned())) {
+        return { messages: [], next_cursor: null, complete: true }
+      }
+
+      const syncResponse = await session.syncMessages(parsedChatId, 0, cursor, maxLogId)
+      this.assertHistorySession(session)
+      assertLocoOk(syncResponse, 'SYNCMSG')
+      if (syncResponse.body.chatLogs != null && !Array.isArray(syncResponse.body.chatLogs)) {
+        throw new Error('message_history_invalid')
+      }
+      const syncBatch = ((syncResponse.body.chatLogs ?? []) as Array<Record<string, unknown>>).filter(
+        (log) => longToString(log.chatId) === normalizedChatId,
+      )
+      const maxReturned = findMaxLogId(syncBatch, 'logId')
+      const protocolComplete = maxReturned !== null && maxReturned.toUnsigned().greaterThanOrEqual(maxLogId)
+      // Match recent-history proof: an EOF flag cannot make an incomplete
+      // interval a terminal suffix for downstream readers and RAM caches.
+      if (!protocolComplete && syncResponse.body.isOK === true) {
+        throw new Error('message_history_incomplete')
+      }
+
+      return buildMessagePage(syncBatch, count, cursor, protocolComplete, normalizedChatId, this.nameCache)
+    } catch (error) {
+      throw wrapError(error, 'get_message_page_failed')
+    }
   }
 
   async getMessages(chatId: string, options?: { count?: number; from?: string }): Promise<KakaoMessage[]> {
-    return this.executeWithReconnect(async ({ session }) => {
+    const session = await this.acquireSession()
+    try {
+      this.assertHistorySession(session)
+      const count = options?.count ?? 20
+      const cursor = options?.from ? parseLong(options.from) : undefined
+
+      const cid = parseLong(chatId)
+
+      const allMessages: Array<Record<string, unknown>> = []
+      const seenLogIds = new Set<string>()
+      let cur = cursor ?? Long.fromNumber(0)
+
       try {
-        const count = options?.count ?? 20
-        const cursor = options?.from ? parseLong(options.from) : undefined
-
-        const cid = parseLong(chatId)
-
-        const allMessages: Array<Record<string, unknown>> = []
-        const seenLogIds = new Set<string>()
-        let cur = cursor ?? Long.fromNumber(0)
-
-        try {
-          for (let page = 0; page < MAX_PAGES; page++) {
-            const response = await session.getChatLogs([cid], [cur])
-            assertLocoOk(response, 'MCHATLOGS')
-            if (!Array.isArray(response.body.chatLogs)) throw new Error('message_history_invalid')
-
-            const batch = ((response.body.chatLogs ?? []) as Array<Record<string, unknown>>).filter(
-              (log) => longToString(log.chatId) === chatId,
-            )
-            if (batch.length === 0) {
-              if (allMessages.length === 0) break
-              return formatMessages(allMessages, count, chatId, this.nameCache)
-            }
-
-            for (const log of batch) {
-              const lid = longToString(log.logId)
-              if (!seenLogIds.has(lid)) {
-                seenLogIds.add(lid)
-                allMessages.push(log)
-              }
-            }
-
-            const maxLog = findMaxLogId(batch, 'logId')
-            if (!maxLog || maxLog.lessThanOrEqual(cur)) throw new Error('message_history_stalled')
-            if (response.body.eof === true) {
-              return formatMessages(allMessages, count, chatId, this.nameCache)
-            }
-
-            cur = maxLog
-          }
-        } catch (error) {
-          // Let the existing reconnect owner replace a dead session once.
-          if (this.state?.session !== session) throw error
-          allMessages.length = 0
-          seenLogIds.clear()
-          cur = cursor ?? Long.fromNumber(0)
-        }
-
-        if (allMessages.length > 0) {
-          throw new Error('message_history_page_limit')
-        }
-
-        // CHATONROOM represents entering a room and can advance unread state on
-        // the server. Reuse getMessagePage's read-only CHATINFO -> SYNCMSG path.
-        // A missing/stale login watermark proves neither emptiness nor currency.
-        const chatInfoResponse = await session.getChannelInfo(cid)
-        assertLocoOk(chatInfoResponse, 'CHATINFO')
-        const maxLogId = extractChannelMaxLogId(chatInfoResponse.body as Record<string, unknown>, chatId)
-        if (maxLogId.lessThanOrEqual(cur.toUnsigned())) {
-          return []
-        }
-
-        let reachedEnd = false
         for (let page = 0; page < MAX_PAGES; page++) {
-          const response = await session.syncMessages(cid, 80, cur, maxLogId)
-          assertLocoOk(response, 'SYNCMSG')
+          const response = await session.getChatLogs([cid], [cur])
+          this.assertHistorySession(session)
+          assertLocoOk(response, 'MCHATLOGS')
           if (!Array.isArray(response.body.chatLogs)) throw new Error('message_history_invalid')
-          const batch = (response.body.chatLogs as Array<Record<string, unknown>>).filter(
+
+          const batch = ((response.body.chatLogs ?? []) as Array<Record<string, unknown>>).filter(
             (log) => longToString(log.chatId) === chatId,
           )
-          if (batch.length === 0) throw new Error('message_history_unavailable')
+          if (batch.length === 0) {
+            if (allMessages.length === 0) break
+            return formatMessages(allMessages, count, chatId, this.nameCache)
+          }
 
           for (const log of batch) {
             const lid = longToString(log.logId)
@@ -1585,26 +1552,80 @@ export class KakaoTalkClient {
           }
 
           const maxLog = findMaxLogId(batch, 'logId')
+          if (!maxLog || maxLog.lessThanOrEqual(cur)) throw new Error('message_history_stalled')
+          if (response.body.eof === true) {
+            return formatMessages(allMessages, count, chatId, this.nameCache)
+          }
 
-          if (!maxLog || maxLog.toUnsigned().lessThanOrEqual(cur.toUnsigned())) {
-            throw new Error('message_history_stalled')
-          }
-          if (maxLog.toUnsigned().greaterThanOrEqual(maxLogId)) {
-            reachedEnd = true
-            break
-          }
-          if (response.body.isOK === true) throw new Error('message_history_incomplete')
           cur = maxLog
         }
-        if (!reachedEnd) {
-          throw new Error('message_history_page_limit')
+      } catch (error) {
+        // A fallback stays on this operation's acquired session; never replay
+        // history across a replacement, including a late successful response.
+        this.assertHistorySession(session)
+        allMessages.length = 0
+        seenLogIds.clear()
+        cur = cursor ?? Long.fromNumber(0)
+      }
+
+      if (allMessages.length > 0) {
+        throw new Error('message_history_page_limit')
+      }
+
+      // CHATONROOM represents entering a room and can advance unread state on
+      // the server. Use CHATINFO for a fresh target, then SYNCMSG with zero
+      // held logs for the missing interval. Even cnt=0 is not proof of no
+      // read side effects, so this operation must never be replayed.
+      // A missing/stale login watermark proves neither emptiness nor currency.
+      const chatInfoResponse = await session.getChannelInfo(cid)
+      this.assertHistorySession(session)
+      assertLocoOk(chatInfoResponse, 'CHATINFO')
+      const maxLogId = extractChannelMaxLogId(chatInfoResponse.body as Record<string, unknown>, chatId)
+      if (maxLogId.lessThanOrEqual(cur.toUnsigned())) {
+        return []
+      }
+
+      let reachedEnd = false
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const response = await session.syncMessages(cid, 0, cur, maxLogId)
+        this.assertHistorySession(session)
+        assertLocoOk(response, 'SYNCMSG')
+        if (response.body.chatLogs != null && !Array.isArray(response.body.chatLogs)) {
+          throw new Error('message_history_invalid')
+        }
+        const batch = ((response.body.chatLogs ?? []) as Array<Record<string, unknown>>).filter(
+          (log) => longToString(log.chatId) === chatId,
+        )
+        if (batch.length === 0) throw new Error('message_history_unavailable')
+
+        for (const log of batch) {
+          const lid = longToString(log.logId)
+          if (!seenLogIds.has(lid)) {
+            seenLogIds.add(lid)
+            allMessages.push(log)
+          }
         }
 
-        return formatMessages(allMessages, count, chatId, this.nameCache)
-      } catch (error) {
-        throw new KakaoTalkError('message_history_unavailable', 'get_messages_failed', { cause: error })
+        const maxLog = findMaxLogId(batch, 'logId')
+
+        if (!maxLog || maxLog.toUnsigned().lessThanOrEqual(cur.toUnsigned())) {
+          throw new Error('message_history_stalled')
+        }
+        if (maxLog.toUnsigned().greaterThanOrEqual(maxLogId)) {
+          reachedEnd = true
+          break
+        }
+        if (response.body.isOK === true) throw new Error('message_history_incomplete')
+        cur = maxLog
       }
-    })
+      if (!reachedEnd) {
+        throw new Error('message_history_page_limit')
+      }
+
+      return formatMessages(allMessages, count, chatId, this.nameCache)
+    } catch (error) {
+      throw new KakaoTalkError('message_history_unavailable', 'get_messages_failed', { cause: error })
+    }
   }
 
   async getMemberSnapshot(chatId: string): Promise<KakaoMemberSnapshot> {

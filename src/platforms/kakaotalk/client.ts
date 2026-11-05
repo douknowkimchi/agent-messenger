@@ -327,12 +327,27 @@ function longToString(v: unknown): string {
   return String(v ?? 0)
 }
 
-function parseAttachmentJson(raw: unknown): Record<string, unknown> | null {
+// A reply's src_logId is a 64-bit log id the upstream JSON writes as a bare
+// number; JSON.parse rounds it beyond 2^53, so the original could never be
+// named. Its exact digits are taken from the raw text when that text holds
+// exactly one such member and it rounds to the parsed value; otherwise the
+// rounded number stays and consumers treat it as inexact.
+const REPLY_SOURCE_LOG_ID = /"src_logId"\s*:\s*(\d{1,20})(?=\s*[,}])/g
+
+export function parseAttachmentJson(raw: unknown): Record<string, unknown> | null {
   if (typeof raw !== 'string' || raw.length === 0) return null
   try {
     const parsed = JSON.parse(raw) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
     const attachment = parsed as Record<string, unknown>
+    const rounded = attachment.src_logId
+    if (typeof rounded === 'number' && Number.isInteger(rounded) && !Number.isSafeInteger(rounded)) {
+      const written = [...raw.matchAll(REPLY_SOURCE_LOG_ID)]
+      const digits = written.length === 1 ? written[0][1] : null
+      if (digits !== null && BigInt(digits) <= 18446744073709551615n && Number(digits) === rounded) {
+        attachment.src_logId = digits
+      }
+    }
     return Object.keys(attachment).length > 0 ? attachment : null
   } catch {
     return null

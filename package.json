@@ -225,5 +225,6 @@
     "@whiskeysockets/baileys",
     "classic-level",
     "protobufjs"
-  ]
+  ],
+  "ser5HistoryAcceptanceOnly": true
 }

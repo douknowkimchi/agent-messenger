@@ -334,3 +334,194 @@ test('legacy markRead still accepts missing body status', async () => {
   assert.equal(f.writes.length, 1)
   f.client.close()
 })
+
+// History shares the existing session/acquisition owner, but may not replay a
+// potentially applied SYNCMSG. No login, socket, provider or persisted state.
+function historyFixture() {
+  const client = new KakaoTalkClient({ connectionAdmission: () => false })
+  const calls: Array<{ method: string; args: unknown[]; replacement: boolean }> = []
+  let acquisitions = 0
+  const row = (id: unknown, chatId: unknown = 100): Record<string, unknown> => ({
+    chatId, logId: id, type: 1, authorId: 1, message: 'synthetic', sendAt: 1,
+  })
+  let mchat = async (): Promise<LocoPacket> => packet({ status: 0, chatLogs: [], eof: true })
+  let info = async (): Promise<LocoPacket> => packet({ status: 0, chatInfo: { chatId: 100, lastLogId: 13 } })
+  let sync = async (): Promise<LocoPacket> => packet({ status: 0, chatLogs: [row(11), row(12), row(13)], isOK: false })
+  const makeSession = (replacement: boolean) => ({
+    getChatLogs: async (...args: unknown[]) => { calls.push({ method: 'MCHATLOGS', args, replacement }); return mchat() },
+    getChannelInfo: async (...args: unknown[]) => { calls.push({ method: 'CHATINFO', args, replacement }); return info() },
+    syncMessages: async (...args: unknown[]) => { calls.push({ method: 'SYNCMSG', args, replacement }); return sync() },
+    close() {},
+  })
+  const session = makeSession(false)
+  const replacement = makeSession(true)
+  const state = { session, loginResult: { chatDatas: [] } }
+  Object.assign(client, {
+    state,
+    ensureSession: async () => { acquisitions++; return (client as unknown as { state: typeof state }).state },
+  })
+  const run = (kind: 'recent' | 'page', count = 20, from = '10') => kind === 'recent'
+    ? client.getMessages('100', { count, from }) : client.getMessagePage('100', { count, from })
+  return {
+    client, row, calls, run, acquisitions: () => acquisitions,
+    setMchat: (fn: typeof mchat) => { mchat = fn },
+    setInfo: (fn: typeof info) => { info = fn },
+    setSync: (fn: typeof sync) => { sync = fn },
+    replace: () => Object.assign(client, { state: { ...state, session: replacement } }),
+  }
+}
+
+for (const kind of ['recent', 'page'] as const) {
+  for (const count of [1, 20, 100]) {
+    test(`history repair ${kind} return count ${count} never becomes held-count`, async () => {
+      const f = historyFixture()
+      try {
+        const rows = Array.from({ length: 105 }, (_, n) => f.row(11 + n))
+        f.setInfo(async () => packet({ status: 0, chatInfo: { chatId: 100, lastLogId: 115 } }))
+        f.setSync(async () => packet({ status: 0, chatLogs: rows, isOK: false }))
+        const value = await f.run(kind, count)
+        const messages = Array.isArray(value) ? value : value.messages
+        assert.equal(messages.length, count)
+        assert.equal(messages[0]!.log_id, String(kind === 'recent' ? 116 - count : 11))
+        assert.equal(messages.at(-1)!.log_id, String(kind === 'recent' ? 115 : 10 + count))
+        assert.deepEqual(f.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [['100', '0', '10', '115']])
+        assert.equal(f.acquisitions(), 1)
+      } finally { f.client.close() }
+    })
+  }
+
+  for (const shape of ['missing', 'null', 'array'] as const) {
+    for (const isOK of [false, true]) {
+      test(`history repair ${kind} successful ${shape} isOK=${isOK} stays unmet`, async () => {
+        const f = historyFixture()
+        try {
+          f.setSync(async () => packet({ status: 0, isOK, ...(shape === 'missing' ? {} : { chatLogs: shape === 'null' ? null : [] }) }))
+          if (kind === 'recent' || isOK) {
+            await assert.rejects(f.run(kind), (e: unknown) => {
+              const error = e as Error & { code: string; cause: Error }
+              assert.equal(error.code, kind === 'recent' ? 'get_messages_failed' : 'get_message_page_failed')
+              assert.equal(error.cause.message, kind === 'recent' ? 'message_history_unavailable' : 'message_history_incomplete')
+              return true
+            })
+          } else {
+            assert.deepEqual(await f.run(kind), { messages: [], next_cursor: null, complete: false })
+          }
+          assert.equal(f.calls.filter(c => c.method === 'SYNCMSG').length, 1)
+        } finally { f.client.close() }
+      })
+    }
+  }
+
+  for (const invalid of [{}, 'logs', 0, false]) {
+    test(`history repair ${kind} rejects non-array collection ${JSON.stringify(invalid)}`, async () => {
+      const f = historyFixture()
+      try {
+        f.setSync(async () => packet({ status: 0, chatLogs: invalid, isOK: false }))
+        await assert.rejects(f.run(kind), (e: unknown) => {
+          assert.equal((e as Error & { cause: Error }).cause.message, 'message_history_invalid')
+          return true
+        })
+      } finally { f.client.close() }
+    })
+  }
+
+  for (const boundary of ['acquired', 'mchat-error', 'mchat-empty', 'mchat-terminal', 'mchat-next', 'info-zero', 'info-positive', 'sync-error', 'sync-next', 'sync-terminal', 'sync-close'] as const) {
+    test(`history repair ${kind} ${boundary} replacement blocks replay, fallback, next page and stale success`, async () => {
+      const f = historyFixture()
+      try {
+        if (boundary === 'acquired') {
+          Object.assign(f.client, { acquireSession: async () => {
+            const session = (f.client as unknown as { state: { session: unknown } }).state.session
+            f.replace()
+            return session
+          } })
+        } else if (boundary.startsWith('mchat')) {
+          f.setMchat(async () => {
+            f.replace()
+            if (boundary === 'mchat-error') throw new Error('synthetic lost response')
+            return packet({ status: 0, chatLogs: boundary === 'mchat-empty' ? [] : [f.row(11)], eof: boundary === 'mchat-terminal' })
+          })
+        } else if (boundary.startsWith('info')) {
+          f.setInfo(async () => {
+            f.replace()
+            return packet({ status: 0, chatInfo: { chatId: 100, lastLogId: boundary === 'info-zero' ? 0 : 13 } })
+          })
+        } else {
+          f.setSync(async () => {
+            if (boundary === 'sync-close') f.client.close()
+            else f.replace()
+            if (boundary === 'sync-error') throw new Error('synthetic lost response')
+            return packet({ status: 0, chatLogs: [f.row(boundary === 'sync-next' ? 11 : 13)], isOK: boundary !== 'sync-next' })
+          })
+        }
+        await assert.rejects(f.run(kind), { code: kind === 'recent' ? 'get_messages_failed' : 'get_message_page_failed' })
+        assert.equal(f.calls.some(c => c.replacement), false)
+        assert.ok(f.acquisitions() <= 1)
+        assert.deepEqual(f.calls.map(c => c.method), boundary === 'acquired' ? [] : boundary.startsWith('mchat') ? ['MCHATLOGS'] : boundary.startsWith('info') ? ['MCHATLOGS', 'CHATINFO'] : ['MCHATLOGS', 'CHATINFO', 'SYNCMSG'])
+      } finally { f.client.close() }
+    })
+  }
+
+  test(`history repair ${kind} same-session lost SYNCMSG is not retried`, async () => {
+    const f = historyFixture()
+    try {
+      f.setSync(async () => { throw new Error('synthetic lost response') })
+      await assert.rejects(f.run(kind))
+      assert.equal(f.acquisitions(), 1)
+      assert.equal(f.calls.filter(c => c.method === 'SYNCMSG').length, 1)
+    } finally { f.client.close() }
+  })
+
+  for (const from of ['13', '14']) {
+    test(`history repair ${kind} cursor ${from} at or beyond fresh max sends no SYNCMSG`, async () => {
+      const f = historyFixture()
+      try {
+        const result = await f.run(kind, 20, from)
+        assert.deepEqual(result, kind === 'recent' ? [] : { messages: [], next_cursor: null, complete: true })
+        assert.equal(f.calls.some(c => c.method === 'SYNCMSG'), false)
+      } finally { f.client.close() }
+    })
+  }
+}
+
+for (const id of [13, Long.fromNumber(13), Long.fromString('9007199254740993')]) {
+  test(`history repair exact max ${String(id)} completes independently of BSON promotion and isOK`, async () => {
+    for (const kind of ['recent', 'page'] as const) {
+      const f = historyFixture()
+      try {
+        f.setInfo(async () => packet({ status: 0, chatInfo: { chatId: 100, lastLogId: id } }))
+        f.setSync(async () => packet({ status: 0, chatLogs: [f.row(id)], isOK: false }))
+        const value = await f.run(kind)
+        if (Array.isArray(value)) assert.deepEqual(value.map(m => m.log_id), [String(id)])
+        else { assert.equal(value.complete, true); assert.equal(value.messages[0]!.log_id, String(id)) }
+      } finally { f.client.close() }
+    }
+  })
+}
+
+for (const id of [Number.MAX_SAFE_INTEGER + 1, 13.5, -1, '18446744073709551616', { high: 4294967296, low: 13 }]) {
+  test(`history repair invalid maximum ${JSON.stringify(id)} cannot complete the interval`, async () => {
+    for (const kind of ['recent', 'page'] as const) {
+      const f = historyFixture()
+      try {
+        f.setSync(async () => packet({ status: 0, chatLogs: [f.row(id)], isOK: true }))
+        await assert.rejects(f.run(kind))
+      } finally { f.client.close() }
+    }
+  })
+}
+
+test('history repair normal forward pagination remains one operation on one session', async () => {
+  const f = historyFixture()
+  try {
+    let next = 11
+    f.setSync(async () => packet({ status: 0, chatLogs: [f.row(next++)], isOK: false }))
+    const value = await f.run('recent')
+    assert.deepEqual((value as Array<{ log_id: string }>).map(m => m.log_id), ['11', '12', '13'])
+    assert.deepEqual(f.calls.filter(c => c.method === 'SYNCMSG').map(c => c.args.map(String)), [
+      ['100', '0', '10', '13'], ['100', '0', '11', '13'], ['100', '0', '12', '13'],
+    ])
+    assert.equal(f.acquisitions(), 1)
+    assert.equal(f.calls.some(c => c.replacement), false)
+  } finally { f.client.close() }
+})

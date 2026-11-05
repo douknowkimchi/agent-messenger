@@ -1,3 +1,4 @@
+export { HistoryAcceptanceGuard } from './protocol/history-acceptance'
 export { KakaoTalkClient, KakaoTalkError } from './client'
 export type {
   KakaoConnectionAdmission,

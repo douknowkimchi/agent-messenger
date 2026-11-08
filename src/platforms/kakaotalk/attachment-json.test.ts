@@ -21,10 +21,11 @@ describe('parseAttachmentJson reply source id', () => {
     expect(parseAttachmentJson('{"src_logId":42}')?.src_logId).toBe(42)
   })
 
-  it('does not guess when the raw text is ambiguous', () => {
-    // Two members (a nested one too): the rounded value stays, never a pick.
+  it('preserves separate top-level and nested ids without scanning string contents', () => {
+    // A nested member is a distinct value, not an ambiguous match.
     const twice = parseAttachmentJson(`{"src_logId":${LOG_ID},"x":{"src_logId":${LOG_ID}}}`)
-    expect(typeof twice?.src_logId).toBe('number')
+    expect(twice?.src_logId).toBe(LOG_ID)
+    expect(twice?.x).toEqual({ src_logId: LOG_ID })
     // A value in a string elsewhere does not count as the member.
     const quoted = parseAttachmentJson(`{"note":"\\"src_logId\\":1","src_logId":${LOG_ID}}`)
     expect(quoted?.src_logId).toBe(LOG_ID)
@@ -35,4 +36,35 @@ describe('parseAttachmentJson reply source id', () => {
     expect(parseAttachmentJson('[1]')).toBeNull()
     expect(parseAttachmentJson('{')).toBeNull()
   })
+})
+
+
+describe('parseAttachmentJson exact integer contract', () => {
+  it('keeps escaped keys, distinct nested ids, large authors and negative array values exact', () => {
+    const next = '3306475843916627970'
+    expect(parseAttachmentJson(
+      `{"src_log\\u0049d":${LOG_ID},"src_userId":7467363552057858123,"x":{"src_logId":${next}},"ids":[-9110477831976617123,42]}`,
+    )).toEqual({ src_logId: LOG_ID, src_userId: '7467363552057858123', x: { src_logId: next }, ids: ['-9110477831976617123', 42] })
+  })
+
+  it('keeps JSON last-member semantics and does not change quoted text or floating tokens', () => {
+    const text = `quoted "src_logId":${LOG_ID} \\ end`
+    expect(parseAttachmentJson(
+      `{"src_logId":${LOG_ID},"src_logId":42,"text":${JSON.stringify(text)},"float":1.5,"exp":1e3,"negative":-3}`,
+    )).toEqual({ src_logId: 42, text, float: 1.5, exp: 1000, negative: -3 })
+  })
+
+  it('preserves integer digits without replacing field-specific signed or unsigned validators', () => {
+    expect(parseAttachmentJson('{"signed":-9223372036854775808,"unsigned":18446744073709551615,"beyond":18446744073709551616}'))
+      .toEqual({ signed: '-9223372036854775808', unsigned: '18446744073709551615', beyond: '18446744073709551616' })
+  })
+
+  for (const raw of [undefined, null, 42, {}, '', '{}', 'null', 'true', '42', '[]', '[1]', '{',
+    '{9007199254740993:1}', '{-9007199254740993 :1}', '{"x":{9007199254740993\n:1}}',
+    '{"x":01}', '{"x":9007199254740993,}', '{"x":9007199254740993 2}', '{"x":"unterminated}',
+  ]) {
+    it(`rejects non-object, empty or malformed attachment: ${JSON.stringify(raw)}`, () => {
+      expect(parseAttachmentJson(raw)).toBeNull()
+    })
+  }
 })

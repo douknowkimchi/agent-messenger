@@ -90,8 +90,18 @@ describe('recent history proof', () => {
     })
   }
 
+  it('accepts empty MCHATLOGS with terminal SYNCMSG for the approved empty-room contract', async () => {
+    sync.mockResolvedValueOnce(packet({ chatLogs: [], isOK: true }))
+    expect(await (await client()).getMessages('100')).toEqual([])
+    expect(mchat).toHaveBeenCalledTimes(1)
+    expect(info).toHaveBeenCalledTimes(1)
+    expect(sync).toHaveBeenCalledTimes(1)
+    expect(sync.mock.calls[0]?.map(value => String(value))).toEqual(['100', '0', '0', '3'])
+    expect(login).toHaveBeenCalledTimes(1)
+  })
+
   for (const response of [
-    packet({ chatLogs: [], isOK: true }),
+    packet({ chatLogs: [], isOK: false }),
     packet({ chatLogs: [log(3, 200)], isOK: true }),
     packet({ chatLogs: [log(1)], isOK: true }),
     { statusCode: -1, body: { error: 'connection closed' } },

@@ -53,32 +53,30 @@ export async function uploadMultiMediaEntry(opts: UploadToLocoOptions): Promise<
 
 async function runPostStreamComplete(opts: UploadToLocoOptions, opcode: 'POST' | 'MPOST'): Promise<UploadToLocoResult> {
   const device = getLocoDeviceConfig(opts.deviceType)
-
   const conn = new LocoConnection()
-  await conn.connectSecure(opts.shipHost, opts.shipPort)
-
   const totalSize = opts.data.byteLength
   let completeResolve: ((p: LocoPacket | null) => void) | null = null
   let completeTimeout: ReturnType<typeof setTimeout> | null = null
-  const completePromise = new Promise<LocoPacket | null>((resolve) => {
-    completeResolve = resolve
-    completeTimeout = setTimeout(() => {
-      completeTimeout = null
-      resolve(null)
-    }, DEFAULT_COMPLETE_TIMEOUT_MS)
-  })
-  conn.onPush((push) => {
-    if (push.method === 'COMPLETE' && completeResolve) {
-      if (completeTimeout) {
-        clearTimeout(completeTimeout)
-        completeTimeout = null
-      }
-      completeResolve(push)
-      completeResolve = null
-    }
-  })
+  let connectionClosed = false
+  const finishComplete = (packet: LocoPacket | null) => {
+    if (completeTimeout) clearTimeout(completeTimeout)
+    completeTimeout = null
+    const resolve = completeResolve
+    completeResolve = null
+    resolve?.(packet)
+  }
+  conn.onClose(() => { connectionClosed = true; finishComplete(null) })
 
   try {
+    // The allocated connection is owned even if connect/handshake fails.
+    await conn.connectSecure(opts.shipHost, opts.shipPort)
+    if (connectionClosed) throw new Error('Media upload connection closed')
+    const completePromise = new Promise<LocoPacket | null>((resolve) => {
+      completeResolve = resolve
+      completeTimeout = setTimeout(() => finishComplete(null), DEFAULT_COMPLETE_TIMEOUT_MS)
+    })
+    conn.onPush((push) => { if (push.method === 'COMPLETE') finishComplete(push) })
+
     const postBody: Record<string, unknown> = {
       k: opts.shipToken,
       s: totalSize,
@@ -102,28 +100,28 @@ async function runPostStreamComplete(opts: UploadToLocoOptions, opcode: 'POST' |
     }
 
     const postResp = await conn.sendPacket(opcode, postBody)
-    const postOffsetRaw = (postResp.body as Record<string, unknown>).o
-    const postOffset = typeof postOffsetRaw === 'number' ? postOffsetRaw : 0
+    if (connectionClosed) throw new Error('Media upload connection closed')
+    if (postResp.statusCode !== 0 || !postResp.body || typeof postResp.body !== 'object' ||
+        Array.isArray(postResp.body) || (postResp.body.status !== undefined && postResp.body.status !== 0)) {
+      // Do not stream payload on a refused or malformed admission. The caller
+      // keeps thrown upload outcomes conservative rather than inventing success.
+      throw new Error(`${opcode} upload admission unavailable`)
+    }
+    const postOffsetRaw = postResp.body.o
+    const postOffset = postOffsetRaw === undefined ? 0 : postOffsetRaw
+    if (typeof postOffset !== 'number' || !Number.isSafeInteger(postOffset) || postOffset < 0 || postOffset > totalSize) {
+      throw new Error(`${opcode} upload offset invalid`)
+    }
 
     const bytesToSend = opts.data.subarray(postOffset)
     if (bytesToSend.length > 0) {
       await conn.writeRaw(Buffer.from(bytesToSend))
       opts.onProgress?.(totalSize, totalSize)
     }
-
     const completePacket = await completePromise
-    const postStatusCode = postResp.statusCode
-
-    return {
-      completePacket,
-      postStatusCode,
-      postOffset,
-    }
+    return { completePacket, postStatusCode: postResp.statusCode, postOffset }
   } finally {
-    if (completeTimeout) {
-      clearTimeout(completeTimeout)
-      completeTimeout = null
-    }
+    finishComplete(null)
     conn.close()
   }
 }

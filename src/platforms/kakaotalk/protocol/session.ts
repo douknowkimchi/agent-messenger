@@ -10,12 +10,15 @@ import {
   DTYPE,
   LANG,
   MCCMNC,
+  MESSAGING_TLS_PORT,
+  MESSAGING_TLS_OPTIONS,
   PING_INTERVAL_MS,
   PROTOCOL_VERSION,
   getLocoDeviceConfig,
 } from './config'
 import { LocoConnection } from './connection'
 import { validateLoginListResponse } from './login-response'
+import { createMessageIdGenerator } from './message-id'
 import type { BookingResponse, CheckinResponse, LoginListResponse, LocoPacket, SyncState } from './types'
 
 // LOCO opcode string emitted on the wire for typing indicator pulses.
@@ -80,7 +83,32 @@ export function buildJoinOpenLinkBody(linkId: Long, profile: OpenJoinProfileWire
   return { li: linkId, ref: 'EW:', ...profile }
 }
 
+export function connectMessagingServer(
+  connection: Pick<LocoConnection, 'connectTls' | 'connectSecure'>,
+  host: string,
+  port: number,
+  deviceType: KakaoDeviceType,
+): Promise<void> {
+  return deviceType === 'tablet'
+    ? connection.connectTls(host, MESSAGING_TLS_PORT, MESSAGING_TLS_OPTIONS)
+    : connection.connectSecure(host, port)
+}
+
+
+// Pinned upstream tablet defaults only. Public raw WRITE/login options are not
+// introduced here. PC and existing reply/attachment payloads stay unchanged.
+export function buildRoleWriteBody(
+  deviceType: KakaoDeviceType,
+  body: Record<string, unknown>,
+  nextMsgId: () => Long,
+): Record<string, unknown> {
+  if (deviceType !== 'tablet') return body
+  return { ...body, msgId: nextMsgId(), scope: 1, silence: false,
+    noSeen: body.noSeen ?? false, extra: body.extra ?? '{}' }
+}
+
 export class LocoSession {
+  constructor(private nextMessageId?: () => number) {}
   private connection: LocoConnection | null = null
   private pingTimer: ReturnType<typeof setInterval> | null = null
   private pushHandler: ((packet: LocoPacket) => void) | null = null
@@ -95,12 +123,13 @@ export class LocoSession {
     deviceType?: KakaoDeviceType,
   ): Promise<LoginListResponse> {
     this.deviceType = deviceType ?? 'tablet'
+    this.nextMessageId ??= createMessageIdGenerator(deviceUuid)
     const deviceConfig = getLocoDeviceConfig(this.deviceType)
 
     const { host, port } = await this.bookAndCheckin(userId, deviceConfig)
 
     this.connection = new LocoConnection()
-    await this.connection.connectSecure(host, port)
+    await connectMessagingServer(this.connection, host, port, this.deviceType)
 
     if (this.pushHandler) {
       this.connection.onPush(this.pushHandler)
@@ -131,6 +160,7 @@ export class LocoSession {
         lastTokenId,
         lbk,
         rp: new Binary(Buffer.from([0x00, 0x00, 0xff, 0xff, 0x00, 0x00])),
+        ...(this.deviceType === 'tablet' ? { isSw: false } : {}),
         bg: false,
       })
 
@@ -186,9 +216,16 @@ export class LocoSession {
     return { host: checkin.host, port: checkin.port }
   }
 
+  private sendWrite(body: Record<string, unknown>): Promise<LocoPacket> {
+    if (!this.connection || !this.nextMessageId) throw new Error('Not connected')
+    const nextMessageId = this.nextMessageId
+    return this.connection.sendPacket('WRITE',
+      buildRoleWriteBody(this.deviceType, body, () => Long.fromNumber(nextMessageId())))
+  }
+
   async sendMessage(chatId: Long, text: string): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
-    return this.connection.sendPacket('WRITE', {
+    return this.sendWrite({
       chatId,
       msg: text,
       type: 1,
@@ -208,10 +245,10 @@ export class LocoSession {
 
   // Quoted reply — a WRITE with message_type 26 (REPLY) whose `extra` JSON
   // carries the source-message reference. The reply semantics ride entirely on
-  // `type` + `extra`; no extra top-level WRITE fields are needed.
+  // `type` + `extra`; the role-bound owner adds tablet WRITE headers.
   async sendReply(chatId: Long, text: string, extra: Record<string, unknown>): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
-    return this.connection.sendPacket('WRITE', {
+    return this.sendWrite({
       chatId,
       msg: text,
       type: KAKAO_MESSAGE_TYPE.REPLY,
@@ -225,7 +262,7 @@ export class LocoSession {
   // See types.ts → KakaoPhotoExtra / KakaoFileExtra for the per-type shape.
   async sendAttachment(chatId: Long, type: number, extra: Record<string, unknown>, caption = ''): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
-    return this.connection.sendPacket('WRITE', {
+    return this.sendWrite({
       chatId,
       msg: caption,
       type,

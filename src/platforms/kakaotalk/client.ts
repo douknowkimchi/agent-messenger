@@ -1,19 +1,17 @@
-import { existsSync } from 'node:fs'
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
-
 import { Long } from 'bson'
 
-import { getConfigDir } from '@/shared/utils/config-dir'
 import { warn } from '@/shared/utils/stderr'
 
 import { type AttachmentInput, type ResolvedAttachment, planAttachments } from './attachment-router'
 import { isOpenKakaoChatType } from './chat-classifier'
 import { detectImageDimensions } from './image-meta'
 import { sha1Hex } from './media-upload'
+import { KakaoSyncStateStore } from './sync-state-store'
 import { LANG, PC_OS_NAME, getLocoDeviceConfig } from './protocol/config'
+import { parseJsonPreservingIntegers } from './protocol/exact-json'
 import { isSyntheticConnectionClose } from './protocol/login-response'
-import { uploadMediaToLoco, uploadMultiMediaEntry } from './protocol/media-uploader'
+import { type UploadToLocoResult, uploadMediaToLoco, uploadMultiMediaEntry } from './protocol/media-uploader'
+import { createMessageIdGenerator } from './protocol/message-id'
 import { LocoSession } from './protocol/session'
 import type { ChatListResponse, LocoPacket, LoginListResponse, SyncState } from './protocol/types'
 import {
@@ -319,6 +317,12 @@ function bsonToLong(v: unknown): Long | undefined {
   return undefined
 }
 
+function cursorToLong(v: unknown): Long | undefined {
+  if (typeof v === 'number' && Number.isSafeInteger(v)) return Long.fromNumber(v)
+  if (typeof v === 'bigint') return Long.fromBigInt(v)
+  return bsonToLong(v)
+}
+
 function longToString(v: unknown): string {
   if (v && typeof v === 'object' && 'high' in v && 'low' in v) {
     const { high, low } = v as { high: number; low: number }
@@ -327,27 +331,15 @@ function longToString(v: unknown): string {
   return String(v ?? 0)
 }
 
-// A reply's src_logId is a 64-bit log id the upstream JSON writes as a bare
-// number; JSON.parse rounds it beyond 2^53, so the original could never be
-// named. Its exact digits are taken from the raw text when that text holds
-// exactly one such member and it rounds to the parsed value; otherwise the
-// rounded number stays and consumers treat it as inexact.
-const REPLY_SOURCE_LOG_ID = /"src_logId"\s*:\s*(\d{1,20})(?=\s*[,}])/g
-
+// Preserve every bare integer's exact digits before applying attachment shape
+// validation. History and push delivery share this owner; ID range admission
+// remains with each existing consumer.
 export function parseAttachmentJson(raw: unknown): Record<string, unknown> | null {
   if (typeof raw !== 'string' || raw.length === 0) return null
   try {
-    const parsed = JSON.parse(raw) as unknown
+    const parsed = parseJsonPreservingIntegers(raw)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
     const attachment = parsed as Record<string, unknown>
-    const rounded = attachment.src_logId
-    if (typeof rounded === 'number' && Number.isInteger(rounded) && !Number.isSafeInteger(rounded)) {
-      const written = [...raw.matchAll(REPLY_SOURCE_LOG_ID)]
-      const digits = written.length === 1 ? written[0][1] : null
-      if (digits !== null && BigInt(digits) <= 18446744073709551615n && Number(digits) === rounded) {
-        attachment.src_logId = digits
-      }
-    }
     return Object.keys(attachment).length > 0 ? attachment : null
   } catch {
     return null
@@ -390,6 +382,37 @@ function positiveSignedInt64String(value: unknown): string | null {
   if (normalized === null) return null
   const id = BigInt(normalized)
   return id > 0n && id <= MAX_SIGNED_INT64 ? normalized : null
+}
+
+// Share the established SER5 WRITE acknowledgement contract with replies.
+// Only explicit provider rejection may become success:false; malformed or
+// missing acknowledgement remains unknown to the durable Bridge command.
+function assertSendResponse(response: LocoPacket, command: string): void {
+  if (!Number.isSafeInteger(response.statusCode) ||
+      (response.body?.status !== undefined && !Number.isSafeInteger(response.body.status))) {
+    throw new Error(`${command} acknowledgement status invalid`)
+  }
+  assertLocoOk(response, command)
+}
+
+function readMediaCompletion(result: UploadToLocoResult): LocoPacket {
+  // postStatusCode alone does not retain the raw response needed to distinguish
+  // a server refusal from a synthetic connection-close result. Keep it unknown.
+  if (result.postStatusCode !== 0 || !result.completePacket) {
+    throw new Error('Media upload completion unavailable')
+  }
+  assertSendResponse(result.completePacket, 'COMPLETE')
+  return result.completePacket
+}
+
+function readSendAcknowledgement(response: LocoPacket, chatId: string, command = 'WRITE'): string {
+  assertSendResponse(response, command)
+  const logId = positiveSignedInt64String(response.body.logId)
+  if (logId === null || (response.body.chatId !== undefined &&
+      positiveSignedInt64String(response.body.chatId) !== chatId)) {
+    throw new Error(`${command} acknowledgement identity invalid`)
+  }
+  return logId
 }
 
 function parsePositiveSignedInt64(value: string, field: 'peer' | 'chat' | 'link' | 'user'): Long {
@@ -611,14 +634,17 @@ function isOpenChat(chat: ChatData): boolean {
 }
 
 function getOpenLinkId(chat: ChatData): Long | null {
-  // BSON decoding promotes an int64 that fits in 53 bits to a number, and a
-  // real open-link id does, so the wire value usually arrives as a plain
-  // positive integer rather than a Long.
-  const linkId: unknown = chat.li
-  if (typeof linkId === 'number') {
-    return Number.isSafeInteger(linkId) && linkId > 0 ? Long.fromNumber(linkId) : null
-  }
-  return bsonToLong(linkId) ?? null
+  const li = chat.li
+  if (typeof li === 'number') return Number.isSafeInteger(li) && li > 0 ? Long.fromNumber(li) : null
+  const linkId = bsonToLong(li)
+  return linkId && !linkId.isZero() ? linkId : null
+}
+
+function getTitleOpenLinkId(chat: ChatData | undefined, info: ChannelInfoData | undefined): Long | null {
+  const infoIsObject = info !== null && typeof info === 'object' && !Array.isArray(info)
+  const isOpen = (chat !== undefined && isOpenChat(chat)) || (infoIsObject && isOpenKakaoChatType(info.type))
+  if (!isOpen) return null
+  return (chat ? getOpenLinkId(chat) : null) ?? (infoIsObject ? getOpenLinkId({ li: info.li }) : null)
 }
 
 function matchesSearch(chat: ChatData, term: string): boolean {
@@ -720,38 +746,6 @@ function isLoginResponseError(
 }
 
 const MAX_PAGES = 50
-
-function syncStatePath(deviceUuid: string): string {
-  return join(getConfigDir(), `kakaotalk-sync-state-${deviceUuid}.json`)
-}
-
-async function loadSyncState(deviceUuid: string): Promise<SyncState | undefined> {
-  const path = syncStatePath(deviceUuid)
-  if (!existsSync(path)) return undefined
-  const content = await readFile(path, 'utf-8')
-  const parsed = JSON.parse(content) as Partial<SyncState>
-
-  if (
-    parsed.version !== 2 ||
-    typeof parsed.revision !== 'number' ||
-    !Array.isArray(parsed.chatIds) ||
-    !Array.isArray(parsed.maxIds) ||
-    parsed.chatIds.length !== parsed.maxIds.length ||
-    !parsed.lastTokenId ||
-    typeof parsed.lbk !== 'number'
-  ) {
-    return undefined
-  }
-
-  return parsed as SyncState
-}
-
-async function saveSyncState(deviceUuid: string, state: SyncState): Promise<void> {
-  await mkdir(getConfigDir(), { recursive: true })
-  const path = syncStatePath(deviceUuid)
-  await writeFile(path, JSON.stringify(state, null, 2))
-  await chmod(path, 0o600)
-}
 
 function toLongLike(v: unknown): { low: number; high: number } {
   if (v && typeof v === 'object' && 'low' in v && 'high' in v) {
@@ -1209,6 +1203,7 @@ export class KakaoTalkClient {
   private state: SessionState | null = null
   private initPromise: Promise<SessionState> | null = null
   private closed = false
+  private nextMessageId: (() => number) | null = null
   private pushHandlers = new Set<KakaoPushHandler>()
   private sessionEventHandlers = new Set<KakaoSessionEventHandler>()
   private nameCache = new MemberNameCache()
@@ -1329,11 +1324,17 @@ export class KakaoTalkClient {
     return this.state !== null && !this.closed
   }
 
-  private async executeWithReconnect<T>(operation: (state: SessionState) => Promise<T>): Promise<T> {
+  private async executeWithReconnect<T>(
+    operation: (state: SessionState) => Promise<T>,
+    retryOnDisconnect = true,
+  ): Promise<T> {
     let state = await this.ensureSession()
     try {
       return await operation(state)
     } catch (error) {
+      // Upstream's per-operation retry boundary, without its unsafe send opt-in.
+      // A lost acknowledgement never authorizes another message dispatch.
+      if (!retryOnDisconnect) throw error
       // Only retry when the session we started with is dead (desktop app eviction,
       // network drop, etc.). Comparing session identity (not just null) handles the case
       // where a concurrent call already reconnected and replaced this.state.
@@ -1408,7 +1409,8 @@ export class KakaoTalkClient {
   }
 
   private async connect(credentials?: ReturnType<KakaoTalkClient['getCredentials']>): Promise<SessionState> {
-    const session = new LocoSession()
+    this.nextMessageId ??= createMessageIdGenerator(credentials?.deviceUuid ?? this.deviceUuid!)
+    const session = new LocoSession(this.nextMessageId)
     session.onPush((packet) => this.dispatchPush(session, packet))
     session.onClose(() => {
       if (this.state?.session === session) {
@@ -1419,7 +1421,8 @@ export class KakaoTalkClient {
     })
 
     try {
-      const syncState = await loadSyncState(credentials?.deviceUuid ?? this.deviceUuid!)
+      const syncStateStore = new KakaoSyncStateStore()
+      const syncState = await syncStateStore.load(credentials?.deviceUuid ?? this.deviceUuid!)
       const loginResult = await session.login(
         credentials?.oauthToken ?? this.oauthToken!,
         credentials?.userId ?? this.userId!,
@@ -1429,7 +1432,7 @@ export class KakaoTalkClient {
       )
 
       const newSyncState = mergeSyncState(syncState, loginResult)
-      await saveSyncState(credentials?.deviceUuid ?? this.deviceUuid!, newSyncState)
+      await syncStateStore.save(credentials?.deviceUuid ?? this.deviceUuid!, newSyncState)
 
       this.nameCache.ingest((loginResult.chatDatas ?? []) as ChatData[])
 
@@ -1512,19 +1515,15 @@ export class KakaoTalkClient {
         // device — LCHATLIST fetches the canonical chat list regardless of device history.
         const snapshotEmpty = allChats.length === 0
         if (options?.all || options?.search || snapshotEmpty) {
-          let cursor: ChatListResponse = loginResult
+          let cursor: ChatListResponse = { ...loginResult, lastTokenId: Long.ZERO, lastChatId: Long.ZERO, eof: false }
           let pages = 0
           const requireCompleteList = options?.all === true
 
           while (pages < MAX_PAGES) {
-            // Trust eof only when the snapshot had data. When the snapshot was empty
-            // (new device), ignore eof for the first iteration so we always attempt
-            // at least one LCHATLIST call.
-            if (cursor.eof && !snapshotEmpty) break
-            if (cursor.eof && snapshotEmpty && pages > 0) break
+            if (cursor.eof) break
 
-            const lastTokenId = bsonToLong(cursor.lastTokenId)
-            const lastChatId = bsonToLong(cursor.lastChatId)
+            const lastTokenId = cursorToLong(cursor.lastTokenId)
+            const lastChatId = cursorToLong(cursor.lastChatId)
 
             const response = await session.getChatList(lastTokenId, lastChatId)
             if (requireCompleteList) assertLocoOk(response, 'LCHATLIST')
@@ -1694,17 +1693,29 @@ export class KakaoTalkClient {
 
   private async fetchChatTitle(session: LocoSession, chatId: Long, chat: ChatData | undefined): Promise<string | null> {
     let title: string | null = null
+    let info: ChannelInfoData | undefined
     try {
       const response = await session.getChannelInfo(chatId)
-      title = extractTitle(response.body as Record<string, unknown>)
+      assertLocoOk(response, 'CHATINFO')
+      const body = response.body as Record<string, unknown>
+      const expectedChatId = longToString(chatId)
+      const observed = extractChannelInfo(body, expectedChatId)
+      if (observed.left === true || readStateId(observed.chatId) !== expectedChatId) {
+        throw new Error('CHATINFO response invalid or left room')
+      }
+      // TITLE metadata is trusted only after the response status, exact room
+      // identity and membership state have all been checked. The same validated
+      // CHATINFO may then supply an open-link fallback when no TITLE exists.
+      info = observed
+      title = extractTitle(body)
     } catch {
       title = null
+      info = undefined
     }
 
     if (title) return title
-    if (!chat || !isOpenChat(chat)) return null
 
-    const linkId = getOpenLinkId(chat)
+    const linkId = getTitleOpenLinkId(chat, info)
     if (!linkId) return null
 
     try {
@@ -2304,17 +2315,21 @@ export class KakaoTalkClient {
             )
           : await session.sendMessage(parseLong(chatId), text)
 
+        const logId = readSendAcknowledgement(response, chatId)
         return {
-          success: response.statusCode === 0,
-          status_code: response.statusCode,
+          success: true,
+          status_code: 0,
           chat_id: chatId,
-          log_id: longToString(response.body.logId),
+          log_id: logId,
           sent_at: response.body.sendAt as number,
         }
       } catch (error) {
-        throw wrapError(error, 'send_message_failed')
+        if (error instanceof LocoResponseError && error.responseFailureKind === 'provider_rejection') {
+          return { success: false, status_code: error.serverStatus!, chat_id: chatId, log_id: '0', sent_at: 0 }
+        }
+        throw wrapError(error, 'send_message_failed', { classifyResponseFailure: true })
       }
-    })
+    }, false)
   }
 
   /** One plain WRITE on the already connected session. Never acquire or replay on a replacement. */
@@ -2325,16 +2340,7 @@ export class KakaoTalkClient {
     }
     try {
       const response = await this.state.session.sendMessage(target, text)
-      if (!Number.isSafeInteger(response.statusCode) ||
-          (response.body?.status !== undefined && !Number.isSafeInteger(response.body.status))) {
-        throw new Error('WRITE acknowledgement status invalid')
-      }
-      assertLocoOk(response, 'WRITE')
-      const logId = positiveSignedInt64String(response.body.logId)
-      if (logId === null || (response.body.chatId !== undefined &&
-          positiveSignedInt64String(response.body.chatId) !== chatId)) {
-        throw new Error('WRITE acknowledgement identity invalid')
-      }
+      const logId = readSendAcknowledgement(response, chatId)
       return { success: true, status_code: 0, chat_id: chatId, log_id: logId }
     } catch (error) {
       if (error instanceof LocoResponseError && error.responseFailureKind === 'provider_rejection') {
@@ -2530,21 +2536,22 @@ export class KakaoTalkClient {
           prepared.map((p) => p.ext),
         )
 
-        if (mshipResp.statusCode !== 0) {
-          throw new KakaoTalkError(`MSHIP rejected (status ${mshipResp.statusCode})`, 'send_multi_photo_failed')
-        }
+        assertSendResponse(mshipResp, 'MSHIP')
 
         const body = mshipResp.body as Record<string, unknown>
         const kl = body.kl as string[] | undefined
         const vhl = body.vhl as string[] | undefined
         const pl = body.pl as number[] | undefined
         if (
-          !kl ||
-          !vhl ||
-          !pl ||
+          !Array.isArray(kl) ||
+          !Array.isArray(vhl) ||
+          !Array.isArray(pl) ||
           kl.length !== prepared.length ||
           vhl.length !== prepared.length ||
-          pl.length !== prepared.length
+          pl.length !== prepared.length ||
+          kl.some(value => typeof value !== 'string' || value.length === 0) ||
+          vhl.some(value => typeof value !== 'string' || value.length === 0) ||
+          pl.some(value => !Number.isInteger(value) || value < 1 || value > 65535)
         ) {
           throw new KakaoTalkError(
             `MSHIP response arrays do not match prepared.length=${prepared.length}: ` +
@@ -2553,7 +2560,8 @@ export class KakaoTalkClient {
           )
         }
 
-        await Promise.all(
+        this.assertMediaSession(session)
+        const uploads = await Promise.allSettled(
           prepared.map((p, i) =>
             uploadMultiMediaEntry({
               shipToken: kl[i]!,
@@ -2571,6 +2579,20 @@ export class KakaoTalkClient {
           ),
         )
 
+        // Settle every sibling before releasing the caller's bytes or the send
+        // slot. MPOST stores an item; only the later FORWARD registers the set.
+        const failures: unknown[] = []
+        for (const item of uploads) {
+          if (item.status === 'rejected') failures.push(item.reason)
+          else {
+            try { readMediaCompletion(item.value) } catch (error) { failures.push(error) }
+          }
+        }
+        if (failures.length > 0) {
+          throw new AggregateError(failures, 'Media uploads were not fully acknowledged')
+        }
+        this.assertMediaSession(session)
+
         const extra: KakaoMultiPhotoExtra = {
           kl,
           wl: prepared.map((p) => p.dim.width),
@@ -2587,17 +2609,27 @@ export class KakaoTalkClient {
           extra as unknown as Record<string, unknown>,
         )
 
+        const logId = readSendAcknowledgement(forwardResp, chatId, 'FORWARD')
         return {
-          success: forwardResp.statusCode === 0,
-          status_code: forwardResp.statusCode,
+          success: true,
+          status_code: 0,
           chat_id: chatId,
-          log_id: longToString((forwardResp.body as Record<string, unknown>).logId),
+          log_id: logId,
           sent_at: ((forwardResp.body as Record<string, unknown>).sendAt as number | undefined) ?? 0,
         }
       } catch (error) {
-        throw wrapError(error, 'send_multi_photo_failed')
+        if (error instanceof LocoResponseError && error.responseFailureKind === 'provider_rejection') {
+          return { success: false, status_code: error.serverStatus!, chat_id: chatId, log_id: '0', sent_at: 0 }
+        }
+        throw wrapError(error, 'send_multi_photo_failed', { classifyResponseFailure: true })
       }
-    })
+    }, false)
+  }
+
+  private assertMediaSession(session: LocoSession): void {
+    if (this.closed || this.admissionFailure || this.state?.session !== session) {
+      throw new Error('Media send session changed before dispatch')
+    }
   }
 
   private async sendMediaViaLoco(opts: {
@@ -2622,9 +2654,7 @@ export class KakaoTalkClient {
           opts.extension,
         )
 
-        if (shipResp.statusCode !== 0) {
-          throw new KakaoTalkError(`SHIP rejected (status ${shipResp.statusCode})`, opts.errorCode)
-        }
+        assertSendResponse(shipResp, 'SHIP')
 
         const body = shipResp.body as Record<string, unknown>
         const shipToken = body.k as string | undefined
@@ -2633,11 +2663,12 @@ export class KakaoTalkClient {
 
         if (typeof shipToken !== 'string' || typeof shipHost !== 'string' || typeof shipPort !== 'number') {
           throw new KakaoTalkError(
-            `SHIP response missing fields: k=${shipToken} vh=${shipHost} p=${shipPort}`,
+            'SHIP response missing upload fields',
             opts.errorCode,
           )
         }
 
+        this.assertMediaSession(session)
         const uploadRes = await uploadMediaToLoco({
           shipToken,
           shipHost,
@@ -2652,21 +2683,26 @@ export class KakaoTalkClient {
           deviceType: this.deviceType,
         })
 
-        const completeBody = uploadRes.completePacket?.body as Record<string, unknown> | undefined
-        const chatLog = completeBody?.chatLog as Record<string, unknown> | undefined
-        const logId = chatLog?.logId
-
+        const complete = readMediaCompletion(uploadRes)
+        const chatLog = complete.body.chatLog as Record<string, unknown> | undefined
+        if (complete.body.chatId !== undefined && positiveSignedInt64String(complete.body.chatId) !== opts.chatId) {
+          throw new Error('COMPLETE acknowledgement identity invalid')
+        }
+        const logId = readSendAcknowledgement({ ...complete, body: chatLog ?? {} }, opts.chatId, 'COMPLETE')
         return {
-          success: uploadRes.completePacket !== null && uploadRes.postStatusCode === 0,
-          status_code: uploadRes.postStatusCode,
+          success: true,
+          status_code: 0,
           chat_id: opts.chatId,
-          log_id: longToString(logId),
+          log_id: logId,
           sent_at: (chatLog?.sendAt as number | undefined) ?? 0,
         }
       } catch (error) {
-        throw wrapError(error, opts.errorCode)
+        if (error instanceof LocoResponseError && error.responseFailureKind === 'provider_rejection') {
+          return { success: false, status_code: error.serverStatus!, chat_id: opts.chatId, log_id: '0', sent_at: 0 }
+        }
+        throw wrapError(error, opts.errorCode, { classifyResponseFailure: true })
       }
-    })
+    }, false)
   }
 
   /**

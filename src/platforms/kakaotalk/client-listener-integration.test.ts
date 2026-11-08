@@ -32,6 +32,28 @@ mock.module('node:fs/promises', () => ({ ...diskPromises,
     return value
   },
   writeFile: async (path: unknown, data: unknown) => { memoryFiles.set(memoryPath(path), String(data)) },
+  open: async (path: unknown, flags: string) => {
+    const directory = String(path).replaceAll('\\', '/') === memoryRoot
+    if (directory && flags === 'r') return { sync: async () => { fsEffects++ }, close: async () => { fsEffects++ } }
+    const key = memoryPath(path)
+    if (flags !== 'wx') throw new Error('Unexpected synthetic open mode')
+    if (memoryFiles.has(key)) throw Object.assign(new Error('Synthetic existing temp'), { code: 'EEXIST' })
+    memoryFiles.set(key, '')
+    return {
+      writeFile: async (data: unknown) => { memoryPath(path); memoryFiles.set(key, String(data)) },
+      sync: async () => { memoryPath(path) },
+      close: async () => { memoryPath(path) },
+    }
+  },
+  rename: async (from: unknown, to: unknown) => {
+    const source = memoryPath(from), target = memoryPath(to)
+    const value = memoryFiles.get(source)
+    if (value === undefined) throw Object.assign(new Error('Synthetic missing temp'), { code: 'ENOENT' })
+    memoryFiles.set(target, value); memoryFiles.delete(source)
+  },
+  rm: async (path: unknown) => {
+    if (!memoryFiles.delete(memoryPath(path))) throw Object.assign(new Error('Synthetic missing temp'), { code: 'ENOENT' })
+  },
 }))
 afterAll(() => {
   if (priorConfigDir === undefined) delete process.env.AGENT_MESSENGER_CONFIG_DIR
@@ -106,8 +128,12 @@ class MockLocoSession {
     return this.getChatLogsImpl()
   }
 
+  getChatListImpl: () => Promise<unknown> = async () => ({
+    body: { chatDatas: [], lastTokenId: { low: 0, high: 0 }, eof: true },
+  })
+
   getChatList(): Promise<unknown> {
-    return Promise.resolve({ body: { chatDatas: [], lastTokenId: { low: 0, high: 0 }, eof: true } })
+    return this.getChatListImpl()
   }
 
   getChatInfo(): Promise<unknown> {
@@ -375,22 +401,17 @@ describe('KakaoTalkClient + KakaoTalkListener integration (shared LOCO session)'
       expect(sessions.length).toBe(1)
       expect(loginCalls.length).toBe(1)
 
-      // Make the live session's sendMessage drop the socket and then throw — modeling a
-      // mid-flight TCP reset where the remote-close handler nulls this.state synchronously
-      // before the operation rejection bubbles up to executeWithReconnect's catch block.
-      // This is the precise window the executeWithReconnect retry path was designed for.
+      // Read-only operations still retry through one shared replacement.
+      // Message writes now preserve unknown outcome rather than replaying here;
+      // their single-dispatch contract is covered by SDK04 text delivery tests.
       const dead = sessions[0]!
-      dead.sendMessageImpl = async function () {
+      dead.getChatListImpl = async function () {
         dead.simulateRemoteClose()
         throw new Error('socket closed')
       }
 
-      // when — three concurrent sendMessage calls all hit the dead session and retry
-      await Promise.all([
-        client.sendMessage('100', 'a'),
-        client.sendMessage('100', 'b'),
-        client.sendMessage('100', 'c'),
-      ])
+      // when — three concurrent list reads hit the dead session and retry
+      await Promise.all([client.getChats(), client.getChats(), client.getChats()])
 
       // then — exactly ONE replacement LOGINLIST regardless of retry collisions
       expect(peakInflight).toBe(1)
@@ -625,8 +646,9 @@ describe('SDK_ADMISSION', () => {
       const client = await admittedClient(() => ++admissions === 1 ? true : gate.promise)
       await client.acquireSession()
       const dead = currentSession()
-      dead.sendMessageImpl = async () => { dead.simulateRemoteClose(); throw new Error('Synthetic socket close') }
-      const api = Promise.allSettled([client.sendMessage('100', 'a'), client.sendMessage('100', 'b'), client.sendMessage('100', 'c')])
+      // Exercise the retryable read path, not message writes which must not replay.
+      dead.getChatListImpl = async () => { dead.simulateRemoteClose(); throw new Error('Synthetic socket close') }
+      const api = Promise.allSettled([client.getChats(), client.getChats(), client.getChats()])
       await settle()
       const health = Promise.allSettled([client.acquireSession()])
       expect(admissions).toBe(2)

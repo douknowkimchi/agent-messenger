@@ -342,6 +342,15 @@ export interface KakaoReplyTarget {
   type: number
 }
 
+/** One explicit SYNCMSG verdict; IDs bind input, never prove application. */
+export interface KakaoSyncReadResult {
+  success: true
+  status_code: 0
+  applied: boolean
+  chat_id: string
+  target_log_id: string
+}
+
 export interface KakaoMarkReadResult {
   success: boolean
   status_code: number

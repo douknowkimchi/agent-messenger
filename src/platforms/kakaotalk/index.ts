@@ -34,6 +34,7 @@ export type {
   KakaoLeaveChatOnceResult,
   KakaoLoginResult,
   KakaoMarkReadResult,
+  KakaoSyncReadResult,
   KakaoMember,
   KakaoMemberSnapshot,
   KakaoMessage,

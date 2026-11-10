@@ -1,4 +1,4 @@
-import { cpSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 
 const pkg = JSON.parse(readFileSync('package.json', 'utf8')) as { bin?: Record<string, string> }
 
@@ -16,7 +16,3 @@ for (const file of cliFiles) {
 }
 
 console.log(`Updated shebang in ${updatedCount} CLI files`)
-
-cpSync('src/vendor', 'dist/src/vendor', { recursive: true })
-
-console.log('Copied vendored LINE runtime into dist/src/vendor')

@@ -1584,35 +1584,95 @@ export class KakaoTalkClient {
     const parsedChatId = parseReadStateInput(chatId, 'chat')
     const session = await this.acquireSession()
     try {
-      const response = await session.getChannelInfo(parsedChatId)
-      assertLocoOk(response, 'CHATINFO')
-      const info = extractChannelInfo(response.body, chatId)
-      // extractChannelInfo owns same-room extraction; additionally reject values
-      // its legacy permissive ID conversion could truncate or round.
-      if (readStateId(info.chatId) !== chatId || (info.left !== undefined && info.left !== false)) {
-        throw new Error('CHATINFO response invalid or left room')
-      }
-      const type = requiredChatType(info.type)
-      if ((typeof type === 'number' && !Number.isSafeInteger(type)) || (typeof type === 'string' && !type.trim())) {
-        throw new Error('CHATINFO response invalid type')
-      }
-      const linkId = isOpenKakaoChatType(type) ? readStateId(info.li) : null
-      return {
-        chat_id: chatId,
-        type,
-        last_message_id: readStateId(info.lastLogId),
-        last_read_message_id: readStateId(info.lastSeenLogId),
-        link_id: linkId === '0' ? null : linkId,
-        open_direct: isOpenKakaoChatType(type) && typeof info.directChat === 'boolean' ? info.directChat : null,
-        unread_count:
-          info.invalidNewMessageCount === false &&
-          Number.isSafeInteger(info.newMessageCount) &&
-          (info.newMessageCount as number) >= 0
-            ? (info.newMessageCount as number)
-            : null,
-      }
+      return this.decodeChatReadState(await session.getChannelInfo(parsedChatId), chatId)
     } catch (error) {
       throw wrapError(error, 'get_chat_read_state_failed', { classifyResponseFailure: true })
+    }
+  }
+
+  /** One CHATINFO on an already ready session; never acquire, connect or replay. */
+  async getChatReadStateOnce(chatId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoChatReadState> {
+    const parsedChatId = parseReadStateInput(chatId, 'chat')
+    options.signal?.throwIfAborted()
+    const session = this.state?.session
+    if (!session || this.closed) {
+      throw new KakaoTalkError('Read state session unavailable before dispatch', 'get_chat_read_state_not_dispatched')
+    }
+    try {
+      const response = await session.getChannelInfo(parsedChatId)
+      options.signal?.throwIfAborted()
+      this.assertHistorySession(session)
+      const result = this.decodeChatReadState(response, chatId)
+      this.assertHistorySession(session)
+      return result
+    } catch (error) {
+      throw wrapError(error, 'get_chat_read_state_failed', { classifyResponseFailure: true })
+    }
+  }
+
+  /** Bounded identity observation for an existing open room, never JOIN or reconnect.
+   * At most eight packets: CHATINFO, CHATINFO[, INFOLINK title],
+   * CHATINFO/GETMEM twice, INFOLINK identity. All share one captured session.
+   */
+  async getOpenRoomIdentityOnce(chatId: string, linkId: string, options: { signal?: AbortSignal } = {}): Promise<{
+    read_state: KakaoChatReadState; chat: KakaoChat; members: KakaoMemberSnapshot; link: KakaoOpenLink
+  }> {
+    const cid = parseReadStateInput(chatId, 'chat')
+    const lid = parsePositiveSignedInt64(linkId, 'link')
+    const state = this.state
+    const session = state?.session
+    const check = () => {
+      options.signal?.throwIfAborted()
+      if (!state || !session || this.closed || this.state !== state || this.state.session !== session) {
+        throw new KakaoTalkError('Open room identity session unavailable or replaced', 'get_open_room_identity_failed')
+      }
+    }
+    check()
+    try {
+      const response = await session!.getChannelInfo(cid)
+      check()
+      const read_state = this.decodeChatReadState(response, chatId)
+      if (!isOpenKakaoChatType(read_state.type) || read_state.link_id !== linkId) {
+        throw new Error('open_room_identity_link_mismatch')
+      }
+      const chat = await this.getChatOnSession(session!, cid, chatId, check)
+      check()
+      const members = await this.getMemberSnapshotOnSession(session!, cid, chatId, check)
+      check()
+      const link = await this.getOpenLinkOnSession(session!, lid, linkId, check)
+      check()
+      return { read_state, chat, members, link }
+    } catch (error) {
+      throw wrapError(error, 'get_open_room_identity_failed', { classifyResponseFailure: true })
+    }
+  }
+
+  private decodeChatReadState(response: LocoPacket, chatId: string): KakaoChatReadState {
+    assertLocoOk(response, 'CHATINFO')
+    const info = extractChannelInfo(response.body, chatId)
+    // extractChannelInfo owns same-room extraction; additionally reject values
+    // its legacy permissive ID conversion could truncate or round.
+    if (readStateId(info.chatId) !== chatId || (info.left !== undefined && info.left !== false)) {
+      throw new Error('CHATINFO response invalid or left room')
+    }
+    const type = requiredChatType(info.type)
+    if ((typeof type === 'number' && !Number.isSafeInteger(type)) || (typeof type === 'string' && !type.trim())) {
+      throw new Error('CHATINFO response invalid type')
+    }
+    const linkId = isOpenKakaoChatType(type) ? readStateId(info.li) : null
+    return {
+      chat_id: chatId,
+      type,
+      last_message_id: readStateId(info.lastLogId),
+      last_read_message_id: readStateId(info.lastSeenLogId),
+      link_id: linkId === '0' ? null : linkId,
+      open_direct: isOpenKakaoChatType(type) && typeof info.directChat === 'boolean' ? info.directChat : null,
+      unread_count:
+        info.invalidNewMessageCount === false &&
+        Number.isSafeInteger(info.newMessageCount) &&
+        (info.newMessageCount as number) >= 0
+          ? (info.newMessageCount as number)
+          : null,
     }
   }
 
@@ -1626,53 +1686,73 @@ export class KakaoTalkClient {
    * strings, including DirectChat, MultiChat, PlusChat, MemoChat, OM, and OD;
    * unknown non-empty strings are preserved for forward compatibility.
    */
+  async getChatOnce(chatId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoChat> {
+    const cid = parseChatId(chatId), state = this.state, session = state?.session
+    const check = () => {
+      options.signal?.throwIfAborted()
+      if (!state || !session || this.closed || this.state !== state || this.state.session !== session) {
+        throw new KakaoTalkError('Room snapshot session unavailable or replaced', 'get_room_snapshot_failed')
+      }
+    }
+    check()
+    const result = await this.getChatOnSession(session!, cid, longToString(cid), check)
+    check()
+    return result
+  }
+
   async getChat(chatId: string): Promise<KakaoChat> {
     const parsedChatId = parseChatId(chatId)
     const normalizedChatId = longToString(parsedChatId)
-    return this.executeWithReconnect(async ({ session }) => {
-      try {
-        const response = await session.getChannelInfo(parsedChatId)
-        assertLocoOk(response, 'CHATINFO')
-        const body = response.body as Record<string, unknown>
-        const chatInfo = body.chatInfo
-        const isLeftChatInfo =
-          chatInfo !== null &&
-          typeof chatInfo === 'object' &&
-          !Array.isArray(chatInfo) &&
-          (chatInfo as Record<string, unknown>).left === true
-        if (isLeftChatInfo) {
-          extractChannelInfo(body, normalizedChatId)
-        }
-        if (chatInfo === undefined || chatInfo === null || isLeftChatInfo) {
-          throw new KakaoTalkError('CHATINFO response missing chatInfo', 'get_chat_failed', {
-            responseFailureKind: 'transient_or_unknown',
-            getChatFailureReason: 'chat_info_absent',
-          })
-        }
-        const chat = channelInfoToChatData(body, normalizedChatId)
-        this.nameCache.ingest([chat])
+    return this.executeWithReconnect(({ session }) => this.getChatOnSession(session, parsedChatId, normalizedChatId))
+  }
 
-        let title = extractTitle(body)
-        if (!title && isOpenChat(chat)) {
-          const linkId = getOpenLinkId(chat)
-          if (linkId) {
-            try {
-              const openLinkResponse = await session.getOpenLinkInfo([linkId])
-              title = extractOpenLinkName(openLinkResponse.body as Record<string, unknown>)
-            } catch {
-              title = null
-            }
-          }
-        }
-
-        return formatChat(chat, title, this.nameCache)
-      } catch (error) {
-        throw wrapError(error, 'get_chat_failed', {
-          classifyResponseFailure: true,
-          classifyGetChatFailure: true,
+  private async getChatOnSession(session: LocoSession, parsedChatId: Long, normalizedChatId: string, check?: () => void): Promise<KakaoChat> {
+    check?.()
+    try {
+      const response = await session.getChannelInfo(parsedChatId)
+      check?.()
+      assertLocoOk(response, 'CHATINFO')
+      const body = response.body as Record<string, unknown>
+      const chatInfo = body.chatInfo
+      const isLeftChatInfo =
+        chatInfo !== null &&
+        typeof chatInfo === 'object' &&
+        !Array.isArray(chatInfo) &&
+        (chatInfo as Record<string, unknown>).left === true
+      if (isLeftChatInfo) {
+        extractChannelInfo(body, normalizedChatId)
+      }
+      if (chatInfo === undefined || chatInfo === null || isLeftChatInfo) {
+        throw new KakaoTalkError('CHATINFO response missing chatInfo', 'get_chat_failed', {
+          responseFailureKind: 'transient_or_unknown',
+          getChatFailureReason: 'chat_info_absent',
         })
       }
-    })
+      const chat = channelInfoToChatData(body, normalizedChatId)
+      this.nameCache.ingest([chat])
+
+      let title = extractTitle(body)
+      if (!title && isOpenChat(chat)) {
+        const linkId = getOpenLinkId(chat)
+        if (linkId) {
+          try {
+            const openLinkResponse = await session.getOpenLinkInfo([linkId])
+            check?.()
+            title = extractOpenLinkName(openLinkResponse.body as Record<string, unknown>)
+          } catch (error) {
+            if (check) throw error
+            title = null
+          }
+        }
+      }
+
+      return formatChat(chat, title, this.nameCache)
+    } catch (error) {
+      throw wrapError(error, 'get_chat_failed', {
+        classifyResponseFailure: true,
+        classifyGetChatFailure: true,
+      })
+    }
   }
 
   /**
@@ -1789,10 +1869,34 @@ export class KakaoTalkClient {
     }
   }
 
+  /** Recent room opening only: MCHATLOGS, never a read-marking fallback.
+   * Reuses the existing page/row owner. Four pages maximum on the captured
+   * ready session; an incomplete suffix is unavailable, never an empty success.
+   */
+  async getRecentMessagesReadOnlyOnce(chatId: string, options: { count?: number; signal?: AbortSignal } = {}): Promise<KakaoMessage[]> {
+    parseReadStateInput(chatId, 'chat')
+    const count = options.count ?? 20
+    if (!Number.isInteger(count) || count < 1 || count > 100) throw new KakaoTalkError('Invalid recent count', 'invalid_message_page_count')
+    const state = this.state, session = state?.session
+    const check = () => {
+      options.signal?.throwIfAborted()
+      if (!state || !session || this.closed || this.state !== state || this.state.session !== session) {
+        throw new KakaoTalkError('Recent history session unavailable or replaced', 'message_history_session_changed')
+      }
+    }
+    check()
+    return this.getMessagesOnSession(session!, chatId, { count }, check)
+  }
+
   async getMessages(chatId: string, options?: { count?: number; from?: string }): Promise<KakaoMessage[]> {
-    const session = await this.acquireSession()
+    return this.getMessagesOnSession(await this.acquireSession(), chatId, options)
+  }
+
+  private async getMessagesOnSession(session: LocoSession, chatId: string,
+    options?: { count?: number; from?: string }, readOnlyCheck?: () => void): Promise<KakaoMessage[]> {
     try {
       this.assertHistorySession(session)
+      readOnlyCheck?.()
       const count = options?.count ?? 20
       const cursor = options?.from ? parseLong(options.from) : undefined
 
@@ -1806,9 +1910,11 @@ export class KakaoTalkClient {
       let startAnsweredEmpty = false
 
       try {
-        for (let page = 0; page < MAX_PAGES; page++) {
+        for (let page = 0; page < (readOnlyCheck ? 4 : MAX_PAGES); page++) {
+          readOnlyCheck?.()
           const response = await session.getChatLogs([cid], [cur])
           this.assertHistorySession(session)
+          readOnlyCheck?.()
           assertLocoOk(response, 'MCHATLOGS')
           const batch = validatedHistoryRows(response.body.chatLogs ?? [], chatId)
           if (batch.length === 0) {
@@ -1841,6 +1947,8 @@ export class KakaoTalkClient {
         // A fallback stays on this operation's acquired session; never replay
         // history across a replacement, including a late successful response.
         this.assertHistorySession(session)
+        readOnlyCheck?.()
+        if (readOnlyCheck) throw error
         if (error instanceof KakaoTalkError ||
             (error instanceof LocoResponseError && error.responseFailureKind === 'provider_rejection')) {
           throw error
@@ -1852,6 +1960,7 @@ export class KakaoTalkClient {
         bulkStopped = true
       }
 
+      if (readOnlyCheck) throw new KakaoTalkError('Recent suffix not proved by bounded read-only pages', 'message_history_unavailable')
       if (!bulkStopped) {
         throw new Error('message_history_page_limit')
       }
@@ -1920,54 +2029,75 @@ export class KakaoTalkClient {
     }
   }
 
+  async getMemberSnapshotOnce(chatId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoMemberSnapshot> {
+    const cid = parseChatId(chatId), state = this.state, session = state?.session
+    const check = () => {
+      options.signal?.throwIfAborted()
+      if (!state || !session || this.closed || this.state !== state || this.state.session !== session) {
+        throw new KakaoTalkError('Room snapshot session unavailable or replaced', 'get_room_snapshot_failed')
+      }
+    }
+    check()
+    const result = await this.getMemberSnapshotOnSession(session!, cid, longToString(cid), check)
+    check()
+    return result
+  }
+
   async getMemberSnapshot(chatId: string): Promise<KakaoMemberSnapshot> {
     const parsedChatId = parseChatId(chatId)
     const normalizedChatId = longToString(parsedChatId)
-    return this.executeWithReconnect(async ({ session }) => {
-      try {
-        const firstChatResponse = await session.getChannelInfo(parsedChatId)
-        assertLocoOk(firstChatResponse, 'CHATINFO')
-        const firstChat = channelMemberView(firstChatResponse.body as Record<string, unknown>, normalizedChatId)
-        const firstMemberResponse = await session.getAllMembers(parsedChatId)
-        assertLocoOk(firstMemberResponse, 'GETMEM')
-        const firstMembers = exactMemberRecords(firstMemberResponse.body.members ?? [], 'GETMEM')
-        const secondChatResponse = await session.getChannelInfo(parsedChatId)
-        assertLocoOk(secondChatResponse, 'CHATINFO')
-        const secondChat = channelMemberView(secondChatResponse.body as Record<string, unknown>, normalizedChatId)
-        const secondMemberResponse = await session.getAllMembers(parsedChatId)
-        assertLocoOk(secondMemberResponse, 'GETMEM')
-        const secondMembers = exactMemberRecords(secondMemberResponse.body.members ?? [], 'GETMEM')
-        if (
-          firstChat.activeMembers !== secondChat.activeMembers ||
-          firstMembers.records.length !== firstChat.activeMembers ||
-          secondMembers.records.length !== secondChat.activeMembers ||
-          !sameIds(firstChat.ids, secondChat.ids) ||
-          !sameIds(firstMembers.ids, secondMembers.ids) ||
-          !subsetIds(secondChat.ids, secondMembers.ids)
-        ) {
-          throw new KakaoTalkError('member_snapshot_changed_or_incomplete', 'get_member_snapshot_failed', {
-            memberSnapshotFailure: Object.freeze({
-              firstActiveCount: firstChat.activeMembers,
-              firstMemberCount: firstMembers.records.length,
-              secondActiveCount: secondChat.activeMembers,
-              secondMemberCount: secondMembers.records.length,
-              displayIdsStable: sameIds(firstChat.ids, secondChat.ids),
-              memberIdsStable: sameIds(firstMembers.ids, secondMembers.ids),
-              displayMembersContained: subsetIds(secondChat.ids, secondMembers.ids),
-            }),
-          })
-        }
-        return {
-          chat_id: normalizedChatId,
-          active_members: secondChat.activeMembers,
-          members: mergeMemberRecords(secondMembers.records, secondChat.records).map(formatMember),
-          complete: true,
-          consistency_basis: 'stable_double_read_chatinfo_getmem',
-        }
-      } catch (error) {
-        throw wrapError(error, 'get_member_snapshot_failed')
+    return this.executeWithReconnect(({ session }) => this.getMemberSnapshotOnSession(session, parsedChatId, normalizedChatId))
+  }
+
+  private async getMemberSnapshotOnSession(session: LocoSession, parsedChatId: Long, normalizedChatId: string, check?: () => void): Promise<KakaoMemberSnapshot> {
+    check?.()
+    try {
+      const firstChatResponse = await session.getChannelInfo(parsedChatId)
+      check?.()
+      assertLocoOk(firstChatResponse, 'CHATINFO')
+      const firstChat = channelMemberView(firstChatResponse.body as Record<string, unknown>, normalizedChatId)
+      const firstMemberResponse = await session.getAllMembers(parsedChatId)
+      check?.()
+      assertLocoOk(firstMemberResponse, 'GETMEM')
+      const firstMembers = exactMemberRecords(firstMemberResponse.body.members ?? [], 'GETMEM')
+      const secondChatResponse = await session.getChannelInfo(parsedChatId)
+      check?.()
+      assertLocoOk(secondChatResponse, 'CHATINFO')
+      const secondChat = channelMemberView(secondChatResponse.body as Record<string, unknown>, normalizedChatId)
+      const secondMemberResponse = await session.getAllMembers(parsedChatId)
+      check?.()
+      assertLocoOk(secondMemberResponse, 'GETMEM')
+      const secondMembers = exactMemberRecords(secondMemberResponse.body.members ?? [], 'GETMEM')
+      if (
+        firstChat.activeMembers !== secondChat.activeMembers ||
+        firstMembers.records.length !== firstChat.activeMembers ||
+        secondMembers.records.length !== secondChat.activeMembers ||
+        !sameIds(firstChat.ids, secondChat.ids) ||
+        !sameIds(firstMembers.ids, secondMembers.ids) ||
+        !subsetIds(secondChat.ids, secondMembers.ids)
+      ) {
+        throw new KakaoTalkError('member_snapshot_changed_or_incomplete', 'get_member_snapshot_failed', {
+          memberSnapshotFailure: Object.freeze({
+            firstActiveCount: firstChat.activeMembers,
+            firstMemberCount: firstMembers.records.length,
+            secondActiveCount: secondChat.activeMembers,
+            secondMemberCount: secondMembers.records.length,
+            displayIdsStable: sameIds(firstChat.ids, secondChat.ids),
+            memberIdsStable: sameIds(firstMembers.ids, secondMembers.ids),
+            displayMembersContained: subsetIds(secondChat.ids, secondMembers.ids),
+          }),
+        })
       }
-    })
+      return {
+        chat_id: normalizedChatId,
+        active_members: secondChat.activeMembers,
+        members: mergeMemberRecords(secondMembers.records, secondChat.records).map(formatMember),
+        complete: true,
+        consistency_basis: 'stable_double_read_chatinfo_getmem',
+      }
+    } catch (error) {
+      throw wrapError(error, 'get_member_snapshot_failed')
+    }
   }
 
   /**
@@ -2722,8 +2852,14 @@ export class KakaoTalkClient {
   async getOpenLink(linkId: string): Promise<KakaoOpenLink> {
     const parsedLinkId = parsePositiveSignedInt64(linkId, 'link')
     const session = await this.acquireSession()
+    return this.getOpenLinkOnSession(session, parsedLinkId, linkId)
+  }
+
+  private async getOpenLinkOnSession(session: LocoSession, parsedLinkId: Long, linkId: string, check?: () => void): Promise<KakaoOpenLink> {
+    check?.()
     try {
       const response = await session.getOpenLinkInfo([parsedLinkId])
+      check?.()
       // A successful packet without an object body was received, not lost.
       // Keep non-zero packet/provider statuses in the existing status owner.
       if (response.statusCode === 0 &&

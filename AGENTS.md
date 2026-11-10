@@ -64,4 +64,10 @@ Use the **Release** GitHub Actions workflow (`workflow_dispatch`). It typechecks
 
 ## Opt-in explicit room read
 
+`getChatReadStateOnce` reads CHATINFO only on the already present SDK session. It must not acquire a session, connect, replay, or accept a late response after session replacement/close/cancellation. It shares the legacy reader's response decoder; legacy `getChatReadState` keeps its existing acquisition behavior. This observation alone does not prove an applied read target or retire a durable unknown command.
+
 `KakaoTalkClient.syncReadOnce` reuses the existing `LocoSession.syncMessages` owner once with canonical uint64 `chatId`, `cur=max=target`, and int32 `cnt=0`. A successful header/body with boolean `isOK=true` is applied evidence; false is known not applied; malformed/lost/stale-session results are unknown and never replayed. No link ID is sent. Keep legacy `markRead`/`markReadOnce`, history, authentication lifetime and version/package owners unchanged. Bridge owns durable identity and replay prevention. Synthetic tests do not establish live provider acceptance.
+
+`getOpenRoomIdentityOnce` reads an existing open room through the existing CHATINFO/GETMEM/INFOLINK parsers on one captured ready session (at most eight packets). It never acquires, reconnects, JOINs or marks read; every await fences cancellation and replacement. Legacy readers keep their existing behavior.
+
+`getRecentMessagesReadOnlyOnce` is the opt-in room-opening history owner: reuse existing MCHATLOGS parsing on one captured session with four-page maximum; no SYNCMSG/CHATONROOM/NOTIREAD fallback, no acquire/reconnect. An unproved suffix remains unavailable. `getChatOnce` and `getMemberSnapshotOnce` reuse the current snapshot decoders without session acquisition. Legacy history repair consumers are unchanged.

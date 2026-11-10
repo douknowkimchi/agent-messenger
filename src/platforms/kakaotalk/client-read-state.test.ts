@@ -8,10 +8,78 @@ import { Long } from 'bson'
 import { KakaoTalkClient, KakaoTalkError } from './client'
 import type { KakaoChatReadState } from './index'
 import type { LocoPacket } from './protocol/types'
+import { LocoSession } from './protocol/session'
 
 const ROOM = '9007199254740993'
 const LOG = '18446744073709551615'
 const LINK = '9223372036854775808'
+
+test('one-shot read state uses the ready session without acquisition or writes', async () => {
+  for (const [type, direct, link] of [
+    ['DirectChat', null, null], ['MultiChat', null, null], ['OD', true, LINK], ['OM', false, LINK],
+  ] as const) {
+    const f = fixture({ type, directChat: direct, li: link, invalidNewMessageCount: false, newMessageCount: 3 })
+    const value = await f.client.getChatReadStateOnce(ROOM)
+    assert.equal(value.chat_id, ROOM)
+    assert.equal(value.type, type)
+    assert.equal(value.link_id, link)
+    assert.equal(value.unread_count, 3)
+    assert.equal(f.reads[0].toUnsigned().toString(), ROOM)
+    assert.equal(f.reads.length, 1)
+    assert.equal(f.writes.length, 0)
+    assert.equal(f.counts().acquisitions, 0)
+    f.client.close()
+  }
+})
+
+for (const unavailable of ['missing', 'closed']) test(`one-shot read state refuses ${unavailable} session without login`, async () => {
+  const f = fixture()
+  Object.assign(f.client, unavailable === 'missing' ? { state: null } : { closed: true })
+  await assert.rejects(f.client.getChatReadStateOnce(ROOM), { code: 'get_chat_read_state_not_dispatched' })
+  assert.equal(f.reads.length, 0)
+  assert.equal(f.counts().acquisitions, 0)
+  f.client.close()
+})
+
+test('one-shot read state refuses cancellation before dispatch', async () => {
+  const f = fixture(); const controller = new AbortController(); controller.abort()
+  await assert.rejects(f.client.getChatReadStateOnce(ROOM, { signal: controller.signal }))
+  assert.equal(f.reads.length, 0); assert.equal(f.counts().acquisitions, 0)
+  f.client.close()
+})
+
+for (const failure of ['replace', 'close', 'cancel', 'loss']) test(`one-shot read state rejects ${failure} after one dispatch without replay`, async () => {
+  const f = fixture(); const controller = new AbortController()
+  f.setRead(async () => {
+    if (failure === 'replace') f.replace()
+    if (failure === 'close') f.client.close()
+    if (failure === 'cancel') controller.abort()
+    if (failure === 'loss') throw new Error('synthetic lost response')
+    return packet({ chatInfo: { chatId: ROOM, type: 'OM', lastLogId: LOG, li: LINK } })
+  })
+  await assert.rejects(f.client.getChatReadStateOnce(ROOM, { signal: controller.signal }), { code: 'get_chat_read_state_failed' })
+  assert.equal(f.reads.length, 1); assert.equal(f.writes.length, 0)
+  assert.equal(f.counts().acquisitions, 0)
+  f.client.close()
+})
+
+test('one-shot read state rejects invalid IDs before dispatch', async () => {
+  const f = fixture()
+  for (const id of ['0', '01', '-1', '18446744073709551616', '1e3']) {
+    await assert.rejects(f.client.getChatReadStateOnce(id))
+  }
+  assert.equal(f.reads.length, 0); assert.equal(f.counts().acquisitions, 0)
+  f.client.close()
+})
+
+test('one-shot read state shares strict response validation with the legacy reader', async () => {
+  for (const response of [packet({ chatInfo: { chatId: '2', type: 'OM' } }), packet({}, -1), packet({})]) {
+    const f = fixture(); f.setRead(async () => response)
+    await assert.rejects(f.client.getChatReadStateOnce(ROOM), { code: 'get_chat_read_state_failed' })
+    assert.equal(f.reads.length, 1); assert.equal(f.counts().acquisitions, 0)
+    f.client.close()
+  }
+})
 
 function packet(body: Record<string, unknown> = {}, statusCode = 0): LocoPacket {
   return { packetId: 1, statusCode, method: '', bodyType: 0, body }
@@ -560,5 +628,150 @@ for (const rows of [[], [11], [11, 12]]) {
       })
       assert.equal(recent.calls.filter(c => c.method === 'SYNCMSG').length, 1)
     } finally { recent.client.close() }
+  })
+}
+
+// Existing open-room identity needs no new login or alternate protocol stack.
+function openIdentityFixture(faultAt = 0, fault = '', type: string | number = 'OD') {
+  const client = new KakaoTalkClient({ connectionAdmission: () => false })
+  const controller = new AbortController()
+  const calls: string[] = []
+  const members = [{ userId: Long.ONE, nickName: 'self' }, { userId: Long.fromInt(2), nickName: 'peer' }]
+  const info = { chatId: ROOM, type, directChat: type === 'OD', li: 300, lastLogId: LOG,
+    activeMembersCount: 2, displayMembers: members, invalidNewMessageCount: false, newMessageCount: 3 }
+  let acquisitions = 0
+  const reply = async (method: string, value: Record<string, unknown>) => {
+    calls.push(method)
+    if (calls.length === faultAt) {
+      if (fault === 'loss') throw new Error('synthetic loss')
+      if (fault === 'replace') Object.assign(client, { state: { session: { close: () => {} }, loginResult: {} } })
+      if (fault === 'same-state-replace') state.session = new LocoSession()
+      if (fault === 'close') client.close()
+      if (fault === 'cancel') controller.abort()
+    }
+    return packet(value)
+  }
+  const session = new LocoSession()
+  Object.assign(session, { connection: {
+    sendPacket: async (method: string, body: Record<string, unknown>) => {
+      if (method === 'INFOLINK') {
+        assert.deepEqual(Object.keys(body), ['lis'])
+        assert.deepEqual((body.lis as Long[]).map(x => x.toString()), ['300'])
+        return reply(method, { ols: [{ li: '300', lt: 1, ac: true, ln: 'synthetic', olu: { userId: Long.fromInt(2) } }] })
+      }
+      assert.ok(['CHATINFO', 'GETMEM'].includes(method), 'no login, JOIN or read mark')
+      assert.deepEqual(Object.keys(body), ['chatId'])
+      assert.equal((body.chatId as Long).toUnsigned().toString(), ROOM)
+      return reply(method, method === 'CHATINFO' ? { chatInfo: info } : { members })
+    }, close() {},
+  } })
+  const state = { session, loginResult: {} }
+  Object.assign(client, { state, ensureSession: async () => { acquisitions++; throw new Error('acquisition forbidden') } })
+  return { client, calls, controller, info, acquisitions: () => acquisitions }
+}
+
+for (const type of ['OD', 'OM', 2]) test(`bounded open identity ${type} shares existing parsers in at most eight packets`, async () => {
+  const f = openIdentityFixture(0, '', type)
+  const result = await f.client.getOpenRoomIdentityOnce(ROOM, '300')
+  assert.equal(result.read_state.chat_id, ROOM)
+  assert.equal(result.chat.chat_id, ROOM)
+  assert.equal(result.members.complete, true)
+  assert.equal(result.members.members.length, 2)
+  assert.equal(result.link.owner_user_id, '2')
+  assert.deepEqual(f.calls, ['CHATINFO', 'CHATINFO', 'INFOLINK', 'CHATINFO', 'GETMEM', 'CHATINFO', 'GETMEM', 'INFOLINK'])
+  assert.equal(f.acquisitions(), 0)
+  f.client.close()
+})
+
+for (const fault of ['loss', 'replace', 'same-state-replace', 'close', 'cancel']) {
+  for (let at = 1; at <= 8; at++) test(`bounded open identity stops after packet ${at} on ${fault}`, async () => {
+    const f = openIdentityFixture(at, fault)
+    await assert.rejects(f.client.getOpenRoomIdentityOnce(ROOM, '300', { signal: f.controller.signal }))
+    assert.equal(f.calls.length, at)
+    assert.equal(f.acquisitions(), 0)
+    f.client.close()
+  })
+}
+
+test('bounded open identity refuses invalid IDs, missing session and pre-cancel before dispatch', async () => {
+  for (const mode of ['bad-chat', 'bad-link', 'missing', 'cancel']) {
+    const f = openIdentityFixture()
+    if (mode === 'missing') Object.assign(f.client, { state: null })
+    if (mode === 'cancel') f.controller.abort()
+    await assert.rejects(f.client.getOpenRoomIdentityOnce(mode === 'bad-chat' ? '01' : ROOM,
+      mode === 'bad-link' ? '0' : '300', { signal: f.controller.signal }))
+    assert.equal(f.calls.length, 0); assert.equal(f.acquisitions(), 0)
+    f.client.close()
+  }
+})
+
+test('bounded open identity refuses a different link before follow-up lookups', async () => {
+  const f = openIdentityFixture(); f.info.li = 301
+  await assert.rejects(f.client.getOpenRoomIdentityOnce(ROOM, '300'))
+  assert.deepEqual(f.calls, ['CHATINFO']); assert.equal(f.acquisitions(), 0)
+  f.client.close()
+})
+
+// Recent room opening is deliberately separate from legacy history repair.
+function readOnlyRecentFixture(mode: string) {
+  const client = new KakaoTalkClient({ connectionAdmission: () => { throw new Error('login prohibited') } })
+  const session = new LocoSession(), calls: string[] = [], controller = new AbortController()
+  const state = { session, loginResult: {} }
+  Object.assign(client, { state, acquireSession: async () => { throw new Error('acquire prohibited') } })
+  Object.assign(session, { connection: { close() {}, sendPacket: async (method: string) => {
+    calls.push(method)
+    assert.equal(method, 'MCHATLOGS', 'recent opening cannot send SYNCMSG/NOTIREAD/CHATONROOM')
+    if (mode === 'loss') throw new Error('synthetic response lost')
+    if (mode === 'replace') Object.assign(client, { state: { session: new LocoSession(), loginResult: {} } })
+    if (mode === 'same-state-replace') state.session = new LocoSession()
+    if (mode === 'close') client.close()
+    if (mode === 'cancel') controller.abort()
+    if (mode === 'empty') return packet({ chatLogs: [], eof: true })
+    const id = calls.length
+    return packet({ chatLogs: [{ chatId: mode === 'wrong-room' ? 200 : 100,
+      logId: Long.fromInt(mode === 'stalled' ? 1 : id), type: 1, authorId: 1,
+      message: 'synthetic', sendAt: id }], eof: mode === 'complete' && id === 2 })
+  } } })
+  return { client, calls, controller }
+}
+
+test('read-only recent opening returns a proven suffix through one captured session', async () => {
+  const f = readOnlyRecentFixture('complete')
+  try {
+    const result = await f.client.getRecentMessagesReadOnlyOnce('100', { count: 1 })
+    assert.deepEqual(result.map(m => m.log_id), ['2'])
+    assert.deepEqual(f.calls, ['MCHATLOGS','MCHATLOGS'])
+  } finally { f.client.close() }
+})
+for (const mode of ['empty','loss','replace','same-state-replace','close','cancel','wrong-room','stalled','limit']) {
+  test(`read-only recent opening ${mode} fails without implicit mark, reconnect or fallback`, async () => {
+    const f = readOnlyRecentFixture(mode)
+    try {
+      await assert.rejects(f.client.getRecentMessagesReadOnlyOnce('100', { signal: f.controller.signal }))
+      assert.equal(f.calls.length, mode === 'limit' ? 4 : mode === 'stalled' ? 2 : 1)
+      assert.ok(f.calls.every(method => method === 'MCHATLOGS'))
+    } finally { f.client.close() }
+  })
+}
+test('read-only recent opening validates input and cancellation before dispatch', async () => {
+  const f = readOnlyRecentFixture('complete')
+  try {
+    for (const id of ['0','01','18446744073709551616']) await assert.rejects(f.client.getRecentMessagesReadOnlyOnce(id))
+    await assert.rejects(f.client.getRecentMessagesReadOnlyOnce('100', { count: 101 }))
+    f.controller.abort()
+    await assert.rejects(f.client.getRecentMessagesReadOnlyOnce('100', { signal: f.controller.signal }))
+    assert.equal(f.calls.length, 0)
+  } finally { f.client.close() }
+})
+for (const method of ['getChatOnce','getMemberSnapshotOnce'] as const) {
+  test(`${method} keeps the existing parser on the present session`, async () => {
+    const f = openIdentityFixture(0,'','OM')
+    try { await f.client[method](ROOM); assert.equal(f.calls.length, method === 'getChatOnce' ? 2 : 4); assert.equal(f.acquisitions(),0) }
+    finally { f.client.close() }
+  })
+  for (const fault of ['loss','replace','same-state-replace','close','cancel']) test(`${method} ${fault} sends no follow-up`, async () => {
+    const f = openIdentityFixture(1,fault,'OM')
+    try { await assert.rejects(f.client[method](ROOM,{signal:f.controller.signal})); assert.equal(f.calls.length,1); assert.equal(f.acquisitions(),0) }
+    finally { f.client.close() }
   })
 }

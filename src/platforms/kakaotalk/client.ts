@@ -26,6 +26,7 @@ import {
   type KakaoLeaveChatResult,
   type KakaoLeaveChatOnceResult,
   type KakaoMarkReadResult,
+  type KakaoSyncReadResult,
   type KakaoMember,
   type KakaoMemberSnapshot,
   type KakaoMessage,
@@ -2811,6 +2812,44 @@ export class KakaoTalkClient {
       return { success: true, status_code: 0, outcome: 'joined', ...named }
     } catch (error) {
       throw wrapError(error, 'join_open_direct_unknown', { classifyResponseFailure: true })
+    }
+  }
+
+  /**
+   * Explicit read, opt-in: one empty-range SYNCMSG on the current session.
+   * cur=max=target, cnt=0. No link field, history continuation or replay.
+   * Only a valid isOK boolean is a verdict. Legacy NOTIREAD owners are unchanged.
+   */
+  async syncReadOnce(chatId: string, logId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoSyncReadResult> {
+    const cid = parseReadStateInput(chatId, 'chat')
+    const target = parseReadStateInput(logId, 'log')
+    options.signal?.throwIfAborted()
+    const current = this.state?.session
+    if (!current || this.closed) {
+      throw new KakaoTalkError('Explicit read session unavailable before dispatch', 'sync_read_not_dispatched')
+    }
+    let session: LocoSession
+    try { session = await this.acquireSession() }
+    catch { throw new KakaoTalkError('Explicit read session unavailable before dispatch', 'sync_read_not_dispatched') }
+    options.signal?.throwIfAborted()
+    if (session !== current || this.closed || this.state?.session !== current) {
+      throw new KakaoTalkError('Explicit read session replaced before dispatch', 'sync_read_not_dispatched')
+    }
+    try {
+      const response = await session.syncMessages(cid, 0, target, target)
+      options.signal?.throwIfAborted()
+      this.assertHistorySession(session)
+      // A header/body failure or malformed verdict is unknown, never an ACK.
+      if (response.statusCode !== 0 || !response.body ||
+          (response.body.status !== undefined && response.body.status !== 0) ||
+          typeof response.body.isOK !== 'boolean') {
+        throw new Error('SYNCMSG explicit read verdict unavailable')
+      }
+      // Returned logs are diagnostics only, not applied proof or history input.
+      if (response.body.chatLogs != null) validatedHistoryRows(response.body.chatLogs, chatId)
+      return { success: true, status_code: 0, applied: response.body.isOK, chat_id: chatId, target_log_id: logId }
+    } catch (error) {
+      throw wrapError(error, 'sync_read_unknown', { classifyResponseFailure: true })
     }
   }
 

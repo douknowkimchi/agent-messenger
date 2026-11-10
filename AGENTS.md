@@ -22,7 +22,7 @@ Bun runs TypeScript directly — no compilation step needed.
 `bun run build` compiles to `dist/` for npm consumers who don't have Bun.
 
 1. `tsc` compiles `src/` → `dist/src/` (JS + declarations + source maps)
-2. `tsc-alias` resolves `@/*` path aliases in the compiled output
+2. `scripts/copy-vendor.ts` copies the vendored runtime before `tsc-alias` resolves `@/*` paths. A clean build must never depend on old `dist/` bytes.
 3. `scripts/postbuild.ts` replaces `#!/usr/bin/env bun` → `#!/usr/bin/env node` in CLI files
 4. `module` and `main` in `package.json` point to `dist/cli.js`
 
@@ -61,3 +61,7 @@ Use the **Release** GitHub Actions workflow (`workflow_dispatch`). It typechecks
   - **minor** — New features, new commands, new platform support, breaking changes
   - **patch** — Bug fixes, refactors, docs, dependency updates, minor improvements
 - Never ask the user which version to bump. Decide and proceed.
+
+## Opt-in explicit room read
+
+`KakaoTalkClient.syncReadOnce` reuses the existing `LocoSession.syncMessages` owner once with canonical uint64 `chatId`, `cur=max=target`, and int32 `cnt=0`. A successful header/body with boolean `isOK=true` is applied evidence; false is known not applied; malformed/lost/stale-session results are unknown and never replayed. No link ID is sent. Keep legacy `markRead`/`markReadOnce`, history, authentication lifetime and version/package owners unchanged. Bridge owns durable identity and replay prevention. Synthetic tests do not establish live provider acceptance.

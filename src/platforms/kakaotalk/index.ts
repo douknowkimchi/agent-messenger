@@ -2,6 +2,8 @@ export { KakaoTalkClient, KakaoTalkError } from './client'
 export type {
   KakaoConnectionAdmission,
   KakaoConnectionAdmissionContext,
+  KakaoMediaSendOptions,
+  KakaoMediaSendPhase,
   KakaoTalkClientOptions,
   KakaoSessionEvent,
   KakaoTalkGetChatFailureReason,

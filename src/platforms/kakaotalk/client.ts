@@ -10,10 +10,18 @@ import { warn } from '@/shared/utils/stderr'
 import { type AttachmentInput, type ResolvedAttachment, planAttachments } from './attachment-router'
 import { isOpenKakaoChatType } from './chat-classifier'
 import { detectImageDimensions } from './image-meta'
+import {
+  type MediaIo,
+  type MediaSendAttempt,
+  type MediaSendContext,
+  type MediaSendOutcome,
+  sendMultiPhotoMedia,
+  sendSingleMedia,
+} from './media-send'
 import { sha1Hex } from './media-upload'
 import { LANG, PC_OS_NAME, getLocoDeviceConfig } from './protocol/config'
 import { isSyntheticConnectionClose } from './protocol/login-response'
-import { uploadMediaToLoco, uploadMultiMediaEntry } from './protocol/media-uploader'
+import { type MediaSendPhase, MediaStepError } from './protocol/media-outcome'
 import { LocoSession } from './protocol/session'
 import type { ChatListResponse, LocoPacket, LoginListResponse, SyncState } from './protocol/types'
 import {
@@ -31,7 +39,6 @@ import {
   type KakaoMemberSnapshot,
   type KakaoMessage,
   type KakaoMessagePage,
-  type KakaoMultiPhotoExtra,
   type KakaoOpenJoinProfile,
   type KakaoOpenLink,
   type KakaoOpenSelfProfile,
@@ -68,6 +75,13 @@ export type KakaoSessionEventHandler = (event: KakaoSessionEvent) => void
 
 export type KakaoTalkResponseFailureKind = 'provider_rejection' | 'transient_or_unknown'
 export type KakaoTalkResponseStatusSource = 'packet' | 'body'
+/** The step a failed media send had reached. A fixed diagnostic, never provider or user data. */
+export type KakaoMediaSendPhase = MediaSendPhase
+
+export interface KakaoMediaSendOptions {
+  /** Cancels the upload. A send cancelled after its registration request stays outcome-unknown. */
+  readonly signal?: AbortSignal
+}
 export type KakaoTalkGetChatFailureReason =
   | 'provider_rejection'
   | 'synthetic_connection_close'
@@ -164,6 +178,10 @@ export class KakaoTalkError extends Error {
   readonly memberEntryConsistency?: Readonly<KakaoTalkMemberEntryConsistency>
   /** Set only on an explicit entry failure that kept its ID list and session. */
   memberEntryProgress?: KakaoMemberEntryProgress
+  /** Media sends only: the step that failed. */
+  readonly phase?: KakaoMediaSendPhase
+  /** Media sends only: the provider's status when one was read, else null. */
+  readonly providerStatus?: number | null
 
   constructor(
     message: string,
@@ -178,6 +196,8 @@ export class KakaoTalkError extends Error {
       memberEntryFailure?: Readonly<KakaoTalkMemberEntryFailure>
       memberRecordFailure?: Readonly<KakaoTalkMemberRecordFailure>
       memberEntryConsistency?: Readonly<KakaoTalkMemberEntryConsistency>
+      phase?: KakaoMediaSendPhase
+      providerStatus?: number | null
     },
   ) {
     super(message, options)
@@ -191,6 +211,8 @@ export class KakaoTalkError extends Error {
     this.memberEntryFailure = options?.memberEntryFailure
     this.memberRecordFailure = options?.memberRecordFailure
     this.memberEntryConsistency = options?.memberEntryConsistency
+    this.phase = options?.phase
+    this.providerStatus = options?.providerStatus
   }
 }
 
@@ -1202,6 +1224,15 @@ function buildReplyExtra(target: KakaoReplyTarget): KakaoReplyExtra {
   }
 }
 
+// Each single-media send: its message type, the extension assumed for a name
+// without one, and the code of its outcome-unknown error.
+const SINGLE_MEDIA = {
+  photo: { msgType: KAKAO_MESSAGE_TYPE.PHOTO, extension: 'jpg', unknownCode: 'send_photo_failed' },
+  video: { msgType: KAKAO_MESSAGE_TYPE.VIDEO, extension: 'mp4', unknownCode: 'send_video_failed' },
+  audio: { msgType: KAKAO_MESSAGE_TYPE.AUDIO, extension: 'm4a', unknownCode: 'send_audio_failed' },
+  file: { msgType: KAKAO_MESSAGE_TYPE.FILE, extension: '', unknownCode: 'send_file_failed' },
+} as const
+
 export class KakaoTalkClient {
   private oauthToken: string | null = null
   private userId: string | null = null
@@ -1215,6 +1246,10 @@ export class KakaoTalkClient {
   private nameCache = new MemberNameCache()
   // Entry progress handed out by failed entries; each continues at most once.
   private memberEntryProgress = new WeakMap<KakaoMemberEntryProgress, MemberEntryProgressState>()
+  // Where media bytes go. The defaults are the real media connection and fetch.
+  private mediaIo: MediaIo = {}
+  // Media sends in flight; close() ends the HTTP uploads that need this session.
+  private readonly mediaCloses = new Set<AbortController>()
 
   private readonly connectionAdmission: KakaoConnectionAdmission | undefined
   private admissionSequence = 0
@@ -2549,58 +2584,31 @@ export class KakaoTalkClient {
     }
   }
 
-  async sendPhoto(chatId: string, photo: Uint8Array | Buffer, filename = 'image.jpg'): Promise<KakaoSendResult> {
-    this.ensureAuth()
-    const data = photo instanceof Uint8Array ? photo : new Uint8Array(photo)
-    const dim = detectImageDimensions(data)
-    const checksum = await sha1Hex(data)
-    const ext = filename.includes('.') ? filename.split('.').pop()! : 'jpg'
-
-    return this.sendMediaViaLoco({
-      chatId,
-      data,
-      msgType: KAKAO_MESSAGE_TYPE.PHOTO,
-      filename,
-      checksum,
-      extension: ext,
-      width: dim.width,
-      height: dim.height,
-      errorCode: 'send_photo_failed',
-    })
+  async sendPhoto(
+    chatId: string,
+    photo: Uint8Array | Buffer,
+    filename = 'image.jpg',
+    options: KakaoMediaSendOptions = {},
+  ): Promise<KakaoSendResult> {
+    return this.sendSingleMediaItem(chatId, photo, filename, SINGLE_MEDIA.photo, options)
   }
 
-  async sendVideo(chatId: string, video: Uint8Array | Buffer, filename = 'video.mp4'): Promise<KakaoSendResult> {
-    this.ensureAuth()
-    const data = video instanceof Uint8Array ? video : new Uint8Array(video)
-    const checksum = await sha1Hex(data)
-    const ext = filename.includes('.') ? filename.split('.').pop()! : 'mp4'
-
-    return this.sendMediaViaLoco({
-      chatId,
-      data,
-      msgType: KAKAO_MESSAGE_TYPE.VIDEO,
-      filename,
-      checksum,
-      extension: ext,
-      errorCode: 'send_video_failed',
-    })
+  async sendVideo(
+    chatId: string,
+    video: Uint8Array | Buffer,
+    filename = 'video.mp4',
+    options: KakaoMediaSendOptions = {},
+  ): Promise<KakaoSendResult> {
+    return this.sendSingleMediaItem(chatId, video, filename, SINGLE_MEDIA.video, options)
   }
 
-  async sendAudio(chatId: string, audio: Uint8Array | Buffer, filename = 'audio.m4a'): Promise<KakaoSendResult> {
-    this.ensureAuth()
-    const data = audio instanceof Uint8Array ? audio : new Uint8Array(audio)
-    const checksum = await sha1Hex(data)
-    const ext = filename.includes('.') ? filename.split('.').pop()! : 'm4a'
-
-    return this.sendMediaViaLoco({
-      chatId,
-      data,
-      msgType: KAKAO_MESSAGE_TYPE.AUDIO,
-      filename,
-      checksum,
-      extension: ext,
-      errorCode: 'send_audio_failed',
-    })
+  async sendAudio(
+    chatId: string,
+    audio: Uint8Array | Buffer,
+    filename = 'audio.m4a',
+    options: KakaoMediaSendOptions = {},
+  ): Promise<KakaoSendResult> {
+    return this.sendSingleMediaItem(chatId, audio, filename, SINGLE_MEDIA.audio, options)
   }
 
   async sendFile(
@@ -2608,196 +2616,177 @@ export class KakaoTalkClient {
     file: Uint8Array | Buffer,
     filename: string,
     mimeType = 'application/octet-stream',
+    options: KakaoMediaSendOptions = {},
   ): Promise<KakaoSendResult> {
     void mimeType
-    this.ensureAuth()
-    const data = file instanceof Uint8Array ? file : new Uint8Array(file)
-    const checksum = await sha1Hex(data)
-    const ext = filename.includes('.') ? filename.split('.').pop()! : ''
-
-    return this.sendMediaViaLoco({
-      chatId,
-      data,
-      msgType: KAKAO_MESSAGE_TYPE.FILE,
-      filename,
-      checksum,
-      extension: ext,
-      errorCode: 'send_file_failed',
-    })
+    return this.sendSingleMediaItem(chatId, file, filename, SINGLE_MEDIA.file, options)
   }
 
   async sendMultiPhoto(
     chatId: string,
     photos: Array<{ data: Uint8Array | Buffer; filename?: string }>,
+    options: KakaoMediaSendOptions = {},
   ): Promise<KakaoSendResult> {
-    this.ensureAuth()
     if (photos.length < 2) {
       throw new KakaoTalkError(
         'sendMultiPhoto requires at least 2 photos; use sendPhoto for a single image',
-        'send_multi_photo_failed',
+        'media_not_dispatched',
+        { phase: 'ship', providerStatus: null },
       )
     }
-
-    const prepared = await Promise.all(
-      photos.map(async (p, i) => {
-        const bytes = p.data instanceof Uint8Array ? p.data : new Uint8Array(p.data)
-        const filename = p.filename ?? `image-${i + 1}.jpg`
-        const dim = detectImageDimensions(bytes)
-        const checksum = (await sha1Hex(bytes)).toLowerCase()
-        const ext = filename.includes('.') ? filename.split('.').pop()! : 'jpg'
-        return { bytes, filename, dim, checksum, ext }
+    return this.runMediaSend(
+      chatId,
+      'send_multi_photo_failed',
+      options.signal,
+      async () => ({
+        parsedChatId: parseChatId(chatId),
+        prepared: await Promise.all(
+          photos.map(async (p, i) => {
+            const bytes = p.data instanceof Uint8Array ? p.data : new Uint8Array(p.data)
+            const filename = p.filename ?? `image-${i + 1}.jpg`
+            const dim = detectImageDimensions(bytes)
+            const checksum = (await sha1Hex(bytes)).toLowerCase()
+            const ext = filename.includes('.') ? filename.split('.').pop()! : 'jpg'
+            return { bytes, filename, dim, checksum, ext }
+          }),
+        ),
       }),
+      (context, { parsedChatId, prepared }) =>
+        // The answers are compared with the id as the provider writes it.
+        sendMultiPhotoMedia(context, { chatId: longToString(parsedChatId), parsedChatId, photos: prepared }),
     )
-
-    const parsedChatId = parseChatId(chatId)
-
-    return this.executeWithReconnect(async ({ session }) => {
-      try {
-        const mshipResp = await session.shipMultiMedia(
-          parsedChatId,
-          KAKAO_MESSAGE_TYPE.MULTIPHOTO,
-          prepared.map((p) => p.bytes.byteLength),
-          prepared.map((p) => p.checksum),
-          prepared.map((p) => p.ext),
-        )
-
-        if (mshipResp.statusCode !== 0) {
-          throw new KakaoTalkError(`MSHIP rejected (status ${mshipResp.statusCode})`, 'send_multi_photo_failed')
-        }
-
-        const body = mshipResp.body as Record<string, unknown>
-        const kl = body.kl as string[] | undefined
-        const vhl = body.vhl as string[] | undefined
-        const pl = body.pl as number[] | undefined
-        if (
-          !kl ||
-          !vhl ||
-          !pl ||
-          kl.length !== prepared.length ||
-          vhl.length !== prepared.length ||
-          pl.length !== prepared.length
-        ) {
-          throw new KakaoTalkError(
-            `MSHIP response arrays do not match prepared.length=${prepared.length}: ` +
-              `kl=${kl?.length} vhl=${vhl?.length} pl=${pl?.length}`,
-            'send_multi_photo_failed',
-          )
-        }
-
-        await Promise.all(
-          prepared.map((p, i) =>
-            uploadMultiMediaEntry({
-              shipToken: kl[i]!,
-              shipHost: vhl[i]!,
-              shipPort: pl[i]!,
-              chatId: parsedChatId,
-              msgType: KAKAO_MESSAGE_TYPE.MULTIPHOTO,
-              userId: this.userId!,
-              filename: p.filename,
-              data: p.bytes,
-              width: p.dim.width,
-              height: p.dim.height,
-              deviceType: this.deviceType,
-            }),
-          ),
-        )
-
-        const extra: KakaoMultiPhotoExtra = {
-          kl,
-          wl: prepared.map((p) => p.dim.width),
-          hl: prepared.map((p) => p.dim.height),
-          mtl: prepared.map((p) => p.dim.mimeType),
-          sl: prepared.map((p) => p.bytes.byteLength),
-          csl: prepared.map((p) => p.checksum),
-          cmtl: prepared.map(() => ''),
-        }
-
-        const forwardResp = await session.forwardChat(
-          parsedChatId,
-          KAKAO_MESSAGE_TYPE.MULTIPHOTO,
-          extra as unknown as Record<string, unknown>,
-        )
-
-        return {
-          success: forwardResp.statusCode === 0,
-          status_code: forwardResp.statusCode,
-          chat_id: chatId,
-          log_id: longToString((forwardResp.body as Record<string, unknown>).logId),
-          sent_at: ((forwardResp.body as Record<string, unknown>).sendAt as number | undefined) ?? 0,
-        }
-      } catch (error) {
-        throw wrapError(error, 'send_multi_photo_failed')
-      }
-    })
   }
 
-  private async sendMediaViaLoco(opts: {
-    chatId: string
-    data: Uint8Array
-    msgType: number
-    filename: string
-    checksum: string
-    extension: string
-    width?: number
-    height?: number
-    errorCode: string
-  }): Promise<KakaoSendResult> {
-    const parsedChatId = parseChatId(opts.chatId)
-    return this.executeWithReconnect(async ({ session }) => {
-      try {
-        const shipResp = await session.shipMedia(
-          parsedChatId,
-          opts.msgType,
-          opts.data.byteLength,
-          opts.checksum,
-          opts.extension,
-        )
-
-        if (shipResp.statusCode !== 0) {
-          throw new KakaoTalkError(`SHIP rejected (status ${shipResp.statusCode})`, opts.errorCode)
-        }
-
-        const body = shipResp.body as Record<string, unknown>
-        const shipToken = body.k as string | undefined
-        const shipHost = body.vh as string | undefined
-        const shipPort = body.p as number | undefined
-
-        if (typeof shipToken !== 'string' || typeof shipHost !== 'string' || typeof shipPort !== 'number') {
-          throw new KakaoTalkError(
-            `SHIP response missing fields: k=${shipToken} vh=${shipHost} p=${shipPort}`,
-            opts.errorCode,
-          )
-        }
-
-        const uploadRes = await uploadMediaToLoco({
-          shipToken,
-          shipHost,
-          shipPort,
-          chatId: parsedChatId,
-          msgType: opts.msgType,
-          userId: this.userId!,
-          filename: opts.filename,
-          data: opts.data,
-          width: opts.width,
-          height: opts.height,
-          deviceType: this.deviceType,
-        })
-
-        const completeBody = uploadRes.completePacket?.body as Record<string, unknown> | undefined
-        const chatLog = completeBody?.chatLog as Record<string, unknown> | undefined
-        const logId = chatLog?.logId
-
+  private sendSingleMediaItem(
+    chatId: string,
+    bytes: Uint8Array | Buffer,
+    filename: string,
+    kind: (typeof SINGLE_MEDIA)[keyof typeof SINGLE_MEDIA],
+    options: KakaoMediaSendOptions,
+  ): Promise<KakaoSendResult> {
+    const { msgType } = kind
+    return this.runMediaSend(
+      chatId,
+      kind.unknownCode,
+      options.signal,
+      async () => {
+        const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
+        const parsedChatId = parseChatId(chatId)
         return {
-          success: uploadRes.completePacket !== null && uploadRes.postStatusCode === 0,
-          status_code: uploadRes.postStatusCode,
-          chat_id: opts.chatId,
-          log_id: longToString(logId),
-          sent_at: (chatLog?.sendAt as number | undefined) ?? 0,
+          // The answers are compared with the id as the provider writes it.
+          chatId: longToString(parsedChatId),
+          parsedChatId,
+          data,
+          msgType,
+          filename,
+          image: msgType === KAKAO_MESSAGE_TYPE.PHOTO ? detectImageDimensions(data) : undefined,
+          checksum: await sha1Hex(data),
+          extension: filename.includes('.') ? filename.split('.').pop()! : kind.extension,
         }
-      } catch (error) {
-        throw wrapError(error, opts.errorCode)
+      },
+      sendSingleMedia,
+    )
+  }
+
+  /**
+   * Runs one media send and reports it under one contract:
+   *
+   * - registered: `{ success: true, status_code: 0, chat_id, log_id, sent_at }`;
+   * - the provider explicitly refused and no message was created: returns
+   *   `{ success: false, status_code: <provider status>, log_id: "0", sent_at: 0 }`;
+   * - nothing that can create the message was sent: throws `media_not_dispatched`;
+   * - a request that can create the message may have reached the provider and
+   *   its answer does not settle whether the message exists (missing, unusable,
+   *   or a status with no established meaning): throws `unknownCode`. Never
+   *   `success: false`.
+   *
+   * Every throw carries only `phase` and `providerStatus`. The distinction is
+   * made from how far the attempt got, never from an error's text.
+   */
+  private async runMediaSend<Prepared>(
+    chatId: string,
+    unknownCode: string,
+    signal: AbortSignal = new AbortController().signal,
+    prepare: () => Promise<Prepared>,
+    send: (context: MediaSendContext, prepared: Prepared) => Promise<MediaSendOutcome>,
+  ): Promise<KakaoSendResult> {
+    const attempt: MediaSendAttempt = { phase: 'ship', registrationAttempted: false }
+    const closed = new AbortController()
+    this.mediaCloses.add(closed)
+    let failure: unknown
+    // A cancelled send must not hash the file or acquire a session.
+    const throwIfCancelled = () => {
+      if (signal.aborted) throw new MediaStepError('ship', 'aborted')
+    }
+    try {
+      this.ensureAuth()
+      throwIfCancelled()
+      const prepared = await prepare()
+      throwIfCancelled()
+      const outcome = await this.executeWithReconnect(async ({ session }) => {
+        // executeWithReconnect reruns this on a replacement session. After a
+        // request that can create the message, nothing is dispatched again: a
+        // second send could duplicate it, and its refusal would say nothing
+        // about the first.
+        if (attempt.registrationAttempted) throw failure
+        try {
+          return await send(
+            {
+              session,
+              io: this.mediaIo,
+              userId: this.userId!,
+              deviceType: this.deviceType,
+              accountHeaders: () => this.accountRestHeaders(),
+              positiveId: positiveSignedInt64String,
+              signal,
+              closed: closed.signal,
+              attempt,
+            },
+            prepared,
+          )
+        } catch (error) {
+          failure = error
+          throw error
+        }
+      })
+      if (outcome.kind === 'sent') {
+        return { success: true, status_code: 0, chat_id: chatId, log_id: outcome.logId, sent_at: outcome.sentAt }
       }
-    })
+      return {
+        success: false,
+        status_code: outcome.providerStatus,
+        chat_id: chatId,
+        log_id: longToString(undefined),
+        sent_at: 0,
+      }
+    } catch (error) {
+      const step = error instanceof MediaStepError ? error : null
+      const phase = step?.phase ?? attempt.phase
+      const detail = { phase, providerStatus: step?.providerStatus ?? null }
+      // Both words come from fixed lists; the text is for a reader, not for classification.
+      const where = `${phase}: ${step?.failure ?? 'failed'}`
+      throw attempt.registrationAttempted
+        ? new KakaoTalkError(`Media send outcome unknown (${where})`, unknownCode, detail)
+        : new KakaoTalkError(`Media send not dispatched (${where})`, 'media_not_dispatched', detail)
+    } finally {
+      this.mediaCloses.delete(closed)
+    }
+  }
+
+  // The account's REST identity, shared by getProfile and the media HTTP upload.
+  private accountRestHeaders(): Record<string, string> {
+    const deviceConfig = getLocoDeviceConfig(this.deviceType)
+    const userAgent =
+      deviceConfig.os !== 'android'
+        ? `KT/${deviceConfig.appVersion} Md/${PC_OS_NAME} ${LANG}`
+        : `KT/${deviceConfig.appVersion} An/13 ${LANG}`
+    return {
+      Authorization: `${this.oauthToken}-${this.deviceUuid}`,
+      A: `${deviceConfig.os}/${deviceConfig.appVersion}/${LANG}`,
+      'User-Agent': userAgent,
+      Accept: '*/*',
+      'Accept-Language': LANG,
+    }
   }
 
   /**
@@ -3128,20 +3117,8 @@ export class KakaoTalkClient {
   async getProfile(): Promise<KakaoProfile> {
     this.ensureAuth()
     try {
-      const deviceConfig = getLocoDeviceConfig(this.deviceType)
-      const isPC = deviceConfig.os !== 'android'
-      const apiPrefix = isPC ? 'mac' : 'android'
-      const userAgent = isPC
-        ? `KT/${deviceConfig.appVersion} Md/${PC_OS_NAME} ${LANG}`
-        : `KT/${deviceConfig.appVersion} An/13 ${LANG}`
-
-      const headers = {
-        Authorization: `${this.oauthToken}-${this.deviceUuid}`,
-        A: `${deviceConfig.os}/${deviceConfig.appVersion}/${LANG}`,
-        'User-Agent': userAgent,
-        Accept: '*/*',
-        'Accept-Language': LANG,
-      }
+      const apiPrefix = getLocoDeviceConfig(this.deviceType).os !== 'android' ? 'mac' : 'android'
+      const headers = this.accountRestHeaders()
 
       const [profileRes, settingsRes] = await Promise.all([
         fetch(`https://katalk.kakao.com/${apiPrefix}/profile3/me.json`, { headers }),
@@ -3189,6 +3166,7 @@ export class KakaoTalkClient {
   close(): void {
     this.closed = true
     this.admissionController?.abort()
+    for (const send of this.mediaCloses) send.abort()
     if (this.state) {
       this.state.session.close()
     } else if (this.initPromise) {

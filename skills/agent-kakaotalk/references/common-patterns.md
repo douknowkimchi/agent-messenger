@@ -533,6 +533,15 @@ The `deviceType` determines the LOCO protocol identity: `'tablet'` sends `os: 'a
 
 Reconnect only triggers on actual session death. Operation-level errors (invalid chat ID, server rejection, etc.) are thrown immediately without retry, so side effects like `sendMessage` or `sendAttachment` are never duplicated.
 
+Media sends (`sendPhoto` / `sendVideo` / `sendAudio` / `sendFile` / `sendMultiPhoto`) reconnect only while nothing that can create the message has been sent. They report one of four outcomes:
+
+- `{ success: true, ... }`: the message was registered.
+- `{ success: false, status_code }`: KakaoTalk explicitly refused, and no message was created.
+- throws `KakaoTalkError` with `code === 'media_not_dispatched'`: nothing that can create the message was sent, so retrying is safe.
+- throws `KakaoTalkError` with any other code (`send_photo_failed`, `send_file_failed`, ...): the message may or may not exist. It is not resent automatically; check the chat before sending again.
+
+Every thrown media error carries `phase` (the step that failed) and `providerStatus` (or `null`). Decide from `code`, never from the message text.
+
 Initial `LOGINLIST` failures are classified separately from reconnectable session death:
 
 - `invalid_access_token` with `serverStatus === -950`: the stored Kakao access token has expired or been revoked. Re-authenticate before retrying.

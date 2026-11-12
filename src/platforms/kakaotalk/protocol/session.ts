@@ -249,6 +249,15 @@ export class LocoSession {
     return this.connection.sendPacket('SHIP', body)
   }
 
+  // WRITEMEDIA — registers one media message whose bytes went over the HTTP
+  // upload a SHIP redirect (`rd: true`) selects, on this same session. The
+  // body comes from media-direct's buildDirectWriteBody; this is the only
+  // request of that path that creates a message.
+  async writeMedia(body: Record<string, unknown>): Promise<LocoPacket> {
+    if (!this.connection) throw new Error('Not connected')
+    return this.connection.sendPacket('WRITEMEDIA', body)
+  }
+
   // MSHIP — multi-file equivalent of SHIP. Per-file fields become parallel
   // arrays (sl/csl/el) and the response carries kl/vhl/pl arrays the caller
   // must fan out across — one MPOST connection per entry.

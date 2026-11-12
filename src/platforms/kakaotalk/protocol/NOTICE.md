@@ -107,3 +107,80 @@ or the absence of SYNCMSG read effects.
 Successful omitted/null bulk chatLogs are normalized to an empty collection,
 as in the pinned Android response model. They still require the existing fresh
 target check and never erase a validated prefix or normalize provider refusal.
+
+---
+
+## mooo SHIP-redirect media upload adaptation (2026-11-12)
+
+- Source: https://github.com/frrad/mooo
+- Exact commit: `a638e2447677510ba31766cfae35863b57487550`
+- License: MIT, Copyright (c) 2026 Frederick. The full license text is kept
+  at the top of `media-direct.ts`, which ships with the build.
+- Files adapted (Go to TypeScript, modified):
+  - `internal/protocol/media/direct.go`, `internal/protocol/media/directphoto.go`
+    and `internal/client/media_direct.go` into `media-direct.ts` and the
+    redirect branch of `../media-send.ts`;
+  - the stall limit and COMPLETE wait of `internal/client/media.go` into
+    `media-uploader.ts` (its 4096-byte framing was not adopted);
+  - the duplicate-key rule of `internal/protocol/strictjson` into
+    `media-direct.ts`, checked for every nested object as well.
+- Protocol references read: `research/bridge/SHIP-REDIRECT.md`,
+  `research/bridge/SHIP-REDIRECT-FILE-VIDEO.md`,
+  `research/media-upload-stream.md`, `research/web-error-bodies.md`.
+
+Disposition: **BEHAVIOR_PORT**. A SHIP answered `rd: true` no longer dials the
+trailer endpoint: the existing session, account REST headers and
+`LocoConnection` are reused for prepare, the chunked Kage upload, the ready
+poll and one WRITEMEDIA. No new LOCO connection type, authentication or
+encryption was imported. The donor was not executed here, and none of this was
+run against the provider from this SDK.
+
+Deliberate differences:
+
+- Identity. The donor sends the Mac profile. This SDK sends its own account
+  REST headers (the tablet's `android/...` `A` and `User-Agent` in production)
+  and `talk-agent: <LOCO os>/<app version>`; only the Mac form `macos/...` is
+  the donor's. The donor's research names both official clients for the
+  endpoints and bodies, but the Android header values are unconfirmed.
+- Requests. The chat id is written into the JSON body digit for digit, since it
+  can exceed 2^53. An answer with repeated keys in any object is refused, as in the
+  donor; its size, depth and trailing-data limits are left to `JSON.parse` and
+  the 1 MiB body bound. Node's `fetch` is used with `redirect: 'manual'`; it
+  keeps no cookie jar. A Kage chunk is given to `fetch` as a stream with its
+  exact `Content-Length`, which sends the same bytes and headers as a buffer.
+- Time bounds. The donor relies on the caller's context. Here each prepare or
+  ready request ends after 20 s. A Kage chunk ends after 10 s without `fetch`
+  taking its next 16 KiB, or 120 s after the last one without an answer. The
+  ready poll keeps the donor's 5 s default interval and 600 s cap, measured on
+  the monotonic clock; later answers can only shorten that deadline. No request
+  or sleep outlasts it, and an answer at or after it is not acted on, including
+  READY_DONE. All of these end before WRITEMEDIA.
+- Refusals. A non-2xx answer is a refusal when its JSON body carries a short
+  digit `code` (the content filter's `90025`) or an integer `status`, or when
+  the HTTP status is 4xx; that number is reported. A redirect or a 5xx without
+  such a body is a failed request. Both end before WRITEMEDIA.
+- Scope. Kage (`vk`) only, as in the donor: a Tenth or unchunked ticket stops
+  before any byte is uploaded. Photo, video and file only: audio has no traced
+  HTTP form, and albums (MSHIP) keep the trailer path. No caption is sent,
+  because this SDK's media sends carry none. Photos accept every image type
+  the SDK already sends (the donor accepts JPEG and PNG).
+- Trailer stream. The donor streams 4096-byte frames, as its research says
+  the official Mac client does (8192 on Android), and records that no such
+  upload from a third-party client has been observed. This SDK keeps the one
+  whole-file frame it has always sent, the only framing observed from it
+  against the provider. The stall limit is applied below the framing: that
+  frame is handed to the socket 8192 bytes at a time.
+- Outcome. The donor returns Go errors; this SDK maps the same boundaries to
+  its result contract (`AGENTS.md`, "Media send result contract"), with these
+  differences. A single upload is treated as open from its POST, since the
+  server can answer with COMPLETE alone. An explicit non-zero POST or COMPLETE
+  status is a refusal, as the donor's research classifies it, unless the same
+  answer names a stored message. An answer used as evidence of a stored
+  message (WRITEMEDIA, FORWARD, the COMPLETE push) must carry its command
+  name, as the donor's read loop requires of every reply, and every chat id
+  and log id it states must agree; SHIP, MSHIP, POST and MPOST answers stay
+  matched by packet id alone, as this SDK has always read them. A non-zero
+  WRITEMEDIA status is
+  left outcome-unknown: the donor's bridge reports any status reply as a
+  refusal, but its research calls a failed WRITEMEDIA reply ambiguous and
+  names no status that proves nothing was stored.

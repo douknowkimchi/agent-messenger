@@ -53,12 +53,25 @@ export class LocoConnection {
   // Writes raw bytes onto the LOCO stream after applying the same AES-128-GCM
   // framing as encrypted packets — used by the media-upload POST step where
   // the protocol expects the file payload to follow the POST request inside
-  // the same encrypted channel (chunked into N frames automatically by the
-  // crypto layer's 4-byte-size + nonce + ciphertext + tag wrapping).
-  async writeRaw(data: Buffer): Promise<void> {
+  // the same encrypted channel. The whole payload is one secure frame
+  // (4-byte size + nonce + ciphertext + tag), as it has always been sent.
+  //
+  // With `slices`, that same frame is handed to the socket `bytes` at a time
+  // and each write goes through `each`, so a caller can bound a stalled write
+  // without bounding the whole transfer. The bytes on the wire do not change.
+  async writeRaw(
+    data: Buffer,
+    slices?: { bytes: number; each: (write: Promise<void>) => Promise<void> },
+  ): Promise<void> {
     if (!this.crypto) throw new Error('crypto not initialised')
     const encrypted = this.crypto.encrypt(data)
-    await this.write(encrypted)
+    if (!slices) {
+      await this.write(encrypted)
+      return
+    }
+    for (let at = 0; at < encrypted.length; at += slices.bytes) {
+      await slices.each(this.write(encrypted.subarray(at, at + slices.bytes)))
+    }
   }
 
   async sendPacket(method: string, body: Record<string, unknown> = {}): Promise<LocoPacket> {

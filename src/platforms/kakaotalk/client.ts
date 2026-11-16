@@ -24,6 +24,7 @@ import { isSyntheticConnectionClose } from './protocol/login-response'
 import { type MediaSendPhase, MediaStepError } from './protocol/media-outcome'
 import { LocoSession } from './protocol/session'
 import type { ChatListResponse, LocoPacket, LoginListResponse, SyncState } from './protocol/types'
+import { extractReadWatermarks } from './read-status'
 import {
   KAKAO_MESSAGE_TYPE,
   type KakaoChat,
@@ -43,6 +44,7 @@ import {
   type KakaoOpenLink,
   type KakaoOpenSelfProfile,
   type KakaoProfile,
+  type KakaoReadWatermarks,
   type KakaoReplyExtra,
   type KakaoReplyTarget,
   type KakaoSendResult,
@@ -1246,6 +1248,9 @@ export class KakaoTalkClient {
   private nameCache = new MemberNameCache()
   // Entry progress handed out by failed entries; each continues at most once.
   private memberEntryProgress = new WeakMap<KakaoMemberEntryProgress, MemberEntryProgressState>()
+  // Per session and room: the read positions its first CHATONROOM answered.
+  // The server answers a/w on that first entry only, so it is never repeated.
+  private entryWatermarks = new WeakMap<SessionState, Map<string, Promise<KakaoReadWatermarks>>>()
   // Where media bytes go. The defaults are the real media connection and fetch.
   private mediaIo: MediaIo = {}
   // Media sends in flight; close() ends the HTTP uploads that need this session.
@@ -2136,6 +2141,60 @@ export class KakaoTalkClient {
   }
 
   /**
+   * Every member's read position in the room (CHATONROOM a/w), on the current
+   * session only: no acquire, reconnect, login or retry. CHATONROOM is the
+   * room entry and may clear this account's unread count for the room, so
+   * call it only where opening the room may mark it read. The server answers
+   * a/w only on a session's first CHATONROOM of a room: that first answer
+   * (this call's or an explicit member entry's) is kept and returned again;
+   * a room is never entered twice for it. An entry that answered none, or
+   * failed, stays unavailable for the rest of the session.
+   * Ported from agent-messenger getReadWatermarks (48c987da, dc21ed69; MIT).
+   */
+  async enterRoomReadWatermarks(
+    chatId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<KakaoReadWatermarks> {
+    const cid = parseChatId(chatId)
+    const normalizedChatId = longToString(cid)
+    const state = this.state
+    const check = () => {
+      options.signal?.throwIfAborted()
+      if (!state || this.closed || this.state !== state) {
+        throw new KakaoTalkError('read_watermarks_session_changed', 'get_read_watermarks_failed')
+      }
+    }
+    try {
+      check()
+      const entries = this.entryWatermarksOf(state!)
+      let pending = entries.get(normalizedChatId)
+      if (!pending) {
+        pending = state!.session.enterRoom(cid).then((entry) => {
+          assertLocoOk(entry, 'CHATONROOM')
+          if (longToString(entry.body.c) !== normalizedChatId) throw new Error('read_watermarks_chat_mismatch')
+          return extractReadWatermarks(entry.body as Record<string, unknown>, normalizedChatId)
+        })
+        pending.catch(() => {})
+        entries.set(normalizedChatId, pending)
+      }
+      const value = await pending
+      check()
+      return value
+    } catch (error) {
+      throw wrapError(error, 'get_read_watermarks_failed')
+    }
+  }
+
+  private entryWatermarksOf(state: SessionState): Map<string, Promise<KakaoReadWatermarks>> {
+    let entries = this.entryWatermarks.get(state)
+    if (!entries) {
+      entries = new Map()
+      this.entryWatermarks.set(state, entries)
+    }
+    return entries
+  }
+
+  /**
    * Explicit entry on the current session only: no reconnect, replay or login.
    * Given the progress of an earlier failed entry, it sends no CHATONROOM and
    * asks MEMBER only for the IDs not received yet; the progress is used up.
@@ -2266,6 +2325,15 @@ export class KakaoTalkClient {
     check()
     assertLocoOk(entry, 'CHATONROOM')
     if (longToString(entry.body.c) !== normalizedChatId) throw new Error('member_entry_chat_mismatch')
+    // This session's first entry of the room: its read positions are kept for
+    // enterRoomReadWatermarks, which then sends no second CHATONROOM.
+    const entries = this.entryWatermarksOf(state)
+    if (!entries.has(normalizedChatId)) {
+      const body = entry.body as Record<string, unknown>
+      const kept = Promise.resolve().then(() => extractReadWatermarks(body, normalizedChatId))
+      kept.catch(() => {})
+      entries.set(normalizedChatId, kept)
+    }
     // The profile this account uses in the open chat, from its own olu only.
     const ownOlu = entry.body.olu
     if (ownOlu && typeof ownOlu === 'object' && !Array.isArray(ownOlu) && this.userId) {

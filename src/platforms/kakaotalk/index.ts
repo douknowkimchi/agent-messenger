@@ -44,6 +44,7 @@ export type {
   KakaoMultiPhotoExtra,
   KakaoPhotoExtra,
   KakaoProfile,
+  KakaoReadWatermarks,
   KakaoReplyExtra,
   KakaoReplyTarget,
   KakaoSendResult,

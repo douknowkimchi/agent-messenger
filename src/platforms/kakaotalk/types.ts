@@ -167,6 +167,16 @@ export interface KakaoMemberSnapshot {
   self_open_profile?: KakaoOpenSelfProfile
 }
 
+/**
+ * Every member's read position in one room, as the first CHATONROOM of the
+ * room on one LOCO session answered it (a/w): each user read through the
+ * log `watermark` (exact decimals).
+ */
+export interface KakaoReadWatermarks {
+  chat_id: string
+  watermarks: Array<{ user_id: string; watermark: string }>
+}
+
 /** The signed-in account's profile in one open chat, as its CHATONROOM olu named it. */
 export interface KakaoOpenSelfProfile {
   /** Pinned node-kakao OpenProfileType: 1=MAIN, 2=KAKAO_ANON, 4=KAKAO_ANON_2,

@@ -3129,6 +3129,99 @@ describe('KakaoTalkClient', () => {
     })
   })
 
+  describe('entry read watermarks', () => {
+    async function connected() {
+      const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: '1' })
+      await client.getChats({ resolveTitles: false })
+      return client
+    }
+    const answer = {
+      statusCode: 0,
+      body: { c: makeLong(100), a: [makeLong(1), makeLong(7)], w: [makeLong(120), { low: 0, high: 1 }] },
+    }
+    const seed = {
+      chat_id: '100',
+      watermarks: [
+        { user_id: '1', watermark: '120' },
+        { user_id: '7', watermark: '4294967296' },
+      ],
+    }
+
+    it('enters the room once per session and returns that first answer again', async () => {
+      const client = await connected()
+      mockEnterRoom.mockResolvedValue(answer)
+      expect(await client.enterRoomReadWatermarks('100')).toEqual(seed)
+      expect(await client.enterRoomReadWatermarks('100')).toEqual(seed)
+      expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      expect(mockMarkRead).not.toHaveBeenCalled()
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    it('shares one CHATONROOM between concurrent callers', async () => {
+      const client = await connected()
+      let resolve!: (value: unknown) => void
+      mockEnterRoom.mockImplementation(() => new Promise((r) => (resolve = r)))
+      const first = client.enterRoomReadWatermarks('100')
+      const second = client.enterRoomReadWatermarks('100')
+      await Promise.resolve()
+      resolve(answer)
+      expect(await first).toEqual(seed)
+      expect(await second).toEqual(seed)
+      expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    it('keeps an answer without a/w unavailable and never enters again for it', async () => {
+      const client = await connected()
+      mockEnterRoom.mockResolvedValue({ statusCode: 0, body: { c: makeLong(100), m: [] } })
+      for (let i = 0; i < 2; i++) {
+        const error = await client.enterRoomReadWatermarks('100').catch((e: unknown) => e)
+        expect(error).toBeInstanceOf(KakaoTalkError)
+        expect((error as KakaoTalkError).code).toBe('get_read_watermarks_failed')
+      }
+      expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    it('refuses a rejected entry or one naming another room', async () => {
+      const client = await connected()
+      mockEnterRoom.mockResolvedValueOnce({ statusCode: -805, body: {} })
+      await expect(client.enterRoomReadWatermarks('100')).rejects.toThrow()
+      mockEnterRoom.mockResolvedValueOnce({ ...answer, body: { ...answer.body, c: makeLong(200) } })
+      await expect(client.enterRoomReadWatermarks('300')).rejects.toThrow()
+      expect(mockEnterRoom).toHaveBeenCalledTimes(2)
+      client.close()
+    })
+
+    it('reuses the read positions of an explicit member entry on the same session', async () => {
+      const client = await connected()
+      const rows = [1, 7].map((id) => ({ userId: makeLong(id), nickName: `Member ${id}` }))
+      mockGetChannelInfo.mockResolvedValue(memberChannelInfo(2, rows))
+      mockEnterRoom.mockResolvedValue({ ...answer, body: { ...answer.body, m: rows } })
+      await client.enterRoomMemberSnapshot('100')
+      expect(await client.enterRoomReadWatermarks('100')).toEqual(seed)
+      expect(mockEnterRoom).toHaveBeenCalledTimes(1)
+      client.close()
+    })
+
+    it('sends nothing without the current session and drops a late answer after close', async () => {
+      const idle = new KakaoTalkClient()
+      await expect(idle.enterRoomReadWatermarks('100')).rejects.toThrow('read_watermarks_session_changed')
+      const client = await connected()
+      await expect(client.enterRoomReadWatermarks('100', { signal: AbortSignal.abort() })).rejects.toThrow()
+      expect(mockEnterRoom).not.toHaveBeenCalled()
+      let resolve!: (value: unknown) => void
+      mockEnterRoom.mockImplementation(() => new Promise((r) => (resolve = r)))
+      const pending = client.enterRoomReadWatermarks('100')
+      await Promise.resolve()
+      client.close()
+      resolve(answer)
+      await expect(pending).rejects.toThrow('read_watermarks_session_changed')
+      expect(mockLogin).toHaveBeenCalledTimes(1)
+    })
+  })
+
   describe('explicit member entry', () => {
     async function connected() {
       const client = await new KakaoTalkClient().login({ oauthToken: 'synthetic', userId: '1' })

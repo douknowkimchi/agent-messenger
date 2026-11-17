@@ -40,6 +40,18 @@ function extractPackIdFromPath(path: string | null): string | null {
   return /^\d+$/.test(head) ? head : null
 }
 
+/**
+ * The catch-all form of a push: its body with `type` set to the packet
+ * method. A body that has its own `type` field (a payload value, often a
+ * number) keeps it as `payload_type`; spreading the body after the method
+ * would otherwise replace the method name with that value.
+ */
+export function genericPushEvent(method: string, body: Record<string, unknown>): KakaoTalkPushGenericEvent {
+  const event: KakaoTalkPushGenericEvent = { ...body, type: method }
+  if (Object.hasOwn(body, 'type') && !Object.hasOwn(body, 'payload_type')) event.payload_type = body.type
+  return event
+}
+
 export class KakaoTalkListener {
   private client: KakaoTalkClient
   private running = false
@@ -176,7 +188,7 @@ export class KakaoTalkListener {
           this.emitter.emit('emoticon', emoticonEvent)
         }
 
-        this.emitter.emit('kakaotalk_event', { type: method, ...body })
+        this.emitter.emit('kakaotalk_event', genericPushEvent(method, body))
         break
       }
 
@@ -188,7 +200,7 @@ export class KakaoTalkListener {
           member: { user_id: chatLog.authorId as number },
         }
         this.emitter.emit('member_joined', event)
-        this.emitter.emit('kakaotalk_event', { type: method, ...body })
+        this.emitter.emit('kakaotalk_event', genericPushEvent(method, body))
         break
       }
 
@@ -200,7 +212,7 @@ export class KakaoTalkListener {
           member: { user_id: chatLog.authorId as number },
         }
         this.emitter.emit('member_left', event)
-        this.emitter.emit('kakaotalk_event', { type: method, ...body })
+        this.emitter.emit('kakaotalk_event', genericPushEvent(method, body))
         break
       }
 
@@ -212,12 +224,12 @@ export class KakaoTalkListener {
           watermark: longToString(body.watermark),
         }
         this.emitter.emit('read', event)
-        this.emitter.emit('kakaotalk_event', { type: method, ...body })
+        this.emitter.emit('kakaotalk_event', genericPushEvent(method, body))
         break
       }
 
       default: {
-        const event: KakaoTalkPushGenericEvent = { type: method, ...body }
+        const event = genericPushEvent(method, body)
         this.emitter.emit('kakaotalk_event', event)
         break
       }

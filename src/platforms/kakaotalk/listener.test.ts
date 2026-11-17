@@ -646,6 +646,36 @@ describe('KakaoTalkListener', () => {
       expect(events[1].type).toBe('NEWMEM')
       expect(events[2].type).toBe('CUSTOM_EVENT')
     })
+
+    it('keeps the packet method when the body has its own type field', async () => {
+      const { listener: l, client } = createListener()
+      listener = l
+
+      const events: KakaoTalkPushGenericEvent[] = []
+      const reads: KakaoTalkPushReadEvent[] = []
+      listener.on('kakaotalk_event', (event) => events.push(event))
+      listener.on('read', (event) => reads.push(event))
+
+      await listener.start()
+      client.emitPush('SYNCSAMPLE', { chatId: { high: 0, low: 5 }, type: 3 })
+      client.emitPush('DECUNREAD', {
+        chatId: { high: 0, low: 1 },
+        userId: 42,
+        watermark: { high: 0, low: 999 },
+        type: 'payload',
+      })
+      client.emitPush('PLAIN', { some: 'data' })
+      client.emitPush('BOTH', { type: 1, payload_type: 'own' })
+
+      expect(events.map((event) => event.type)).toEqual(['SYNCSAMPLE', 'DECUNREAD', 'PLAIN', 'BOTH'])
+      expect(events[0].payload_type).toBe(3)
+      expect(events[0].chatId).toEqual({ high: 0, low: 5 })
+      expect(events[1].payload_type).toBe('payload')
+      expect(Object.hasOwn(events[2], 'payload_type')).toBe(false)
+      expect(events[3].payload_type).toBe('own')
+      expect(reads.length).toBe(1)
+      expect(reads[0].watermark).toBe('999')
+    })
   })
 
   describe('stop', () => {

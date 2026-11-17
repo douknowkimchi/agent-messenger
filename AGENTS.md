@@ -81,3 +81,7 @@ Use the **Release** GitHub Actions workflow (`workflow_dispatch`). It typechecks
 ## Entry read positions
 
 `enterRoomReadWatermarks` sends CHATONROOM on the current session only (no acquire, reconnect, login or retry) and returns every member's read position from its a/w arrays (decoder ported from upstream `read-status.ts`, MIT). The server answers a/w only on a session's first CHATONROOM of a room, so the first answer (this call's or an explicit member entry's) is kept per session and room and returned again; a room is never entered twice for it, and an answer without a/w stays unavailable for that session. CHATONROOM may clear this account's unread count for the room: call it only where opening the room may mark it read. Synthetic tests do not establish live provider behavior.
+
+## Push event names
+
+Every `kakaotalk_event` carries the LOCO packet method as `type`. A push body with its own `type` field keeps that value as `payload_type` (unless the body already has `payload_type`); the body is never spread after the method. The typed events (`message`, `member_joined`, `member_left`, `read`) are unchanged.

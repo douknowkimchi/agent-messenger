@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test'
 import { Long } from 'bson'
 import { KakaoTalkClient } from './client'
+import { KakaoMessageSchema } from './types'
+import { decodePacket, encodePacket } from './protocol/packet'
+import { LOCO_BODY_TYPE_BSON } from './protocol/types'
 
 const packet = (body: Record<string, unknown> = {}) => ({ statusCode: 0, body: { status: 0, ...body } })
 const log = (id: number, chatId = 100) => ({
@@ -463,5 +466,145 @@ describe('resumable forward page admission', () => {
   it('rejects a SYNC record beyond its fresh target', async () => {
     sync.mockResolvedValueOnce(packet({ chatLogs: [log(2), log(4)], isOK: false }))
     await expect((await client()).getMessagePage('100', { from: '1', count: 2 })).rejects.toThrow()
+  })
+})
+
+
+describe('native message revision projection', () => {
+  for (const route of ['recent', 'forward'] as const) {
+    const read = async (value: KakaoTalkClient) => {
+      if (route === 'recent') {
+        await value.acquireSession() // Prepare only the synthetic session; the once reader never acquires.
+        return value.getRecentMessagesReadOnlyOnce('100')
+      }
+      return (await value.getMessagePage('100')).messages
+    }
+
+    for (const [label, revision, expected] of [
+      ['zero', 0, '0'], ['one', 1, '1'], ['two', 2, '2'],
+      ['absent', undefined, undefined], ['null', null, undefined],
+      ['Long zero', Long.ZERO, '0'],
+      ['exact Long', Long.fromString('9007199254740993'), '9007199254740993'],
+      ['exact string', '9007199254740993', '9007199254740993'],
+      ['exact bigint', 9007199254740993n, '9007199254740993'],
+      ['max signed int64', Long.MAX_VALUE, '9223372036854775807'],
+    ] as const) {
+      it(`${route} preserves ${label} revision without changing existing fields`, async () => {
+        const row = { ...log(1), ...(revision === undefined ? {} : { revision }) }
+        mchat.mockResolvedValueOnce(packet({ chatLogs: [row], eof: true }))
+        const result = await read(await client())
+        const expectedRow = {
+          log_id: '1', type: 1, author_id: 1, author_name: null,
+          message: 'synthetic-1', attachment: null, sent_at: 1,
+          ...(expected === undefined ? {} : { revision: expected }),
+        }
+        expect(result).toEqual([expectedRow])
+        expect(Object.hasOwn(result[0]!, 'revision')).toBe(expected !== undefined)
+        expect(KakaoMessageSchema.parse(result[0])).toEqual(expectedRow)
+        expect(mchat).toHaveBeenCalledTimes(1)
+        expect(info).not.toHaveBeenCalled()
+        expect(sync).not.toHaveBeenCalled()
+        expect(login).toHaveBeenCalledTimes(1)
+      })
+    }
+
+    for (const [label, revision] of [
+      ['negative number', -1], ['fraction', 1.5], ['NaN', NaN], ['infinity', Infinity],
+      ['unsafe number', Number.MAX_SAFE_INTEGER + 1], ['negative string', '-1'],
+      ['noncanonical string', '01'], ['malformed string', 'bad'],
+      ['negative bigint', -1n], ['uint64 overflow', '18446744073709551616'],
+      ['negative signed Long', Long.NEG_ONE], ['untyped high/low', { high: 0, low: 1 }],
+      ['signed int64 overflow', '9223372036854775808'], ['unsigned Long overflow', Long.MAX_UNSIGNED_VALUE],
+    ] as const) {
+      it(`${route} rejects ${label} revision instead of treating it as absent`, async () => {
+        mchat.mockResolvedValueOnce(packet({ chatLogs: [{ ...log(1), revision }], eof: true }))
+        const failure = await read(await client()).catch(error => error)
+        expect(route === 'recent' ? failure.cause : failure).toMatchObject({ code: 'message_revision_invalid' })
+        expect(mchat).toHaveBeenCalledTimes(1)
+        expect(info).not.toHaveBeenCalled()
+        expect(sync).not.toHaveBeenCalled()
+        expect(login).toHaveBeenCalledTimes(1)
+      })
+    }
+
+    for (const revision of [Long.fromString('9007199254740993'), Long.MAX_VALUE]) {
+      it(`${route} preserves revision ${revision} and log id through the BSON packet body boundary`, async () => {
+        const decoded = decodePacket(encodePacket({
+          packetId: 1, statusCode: 0, method: 'MCHATLOGS', bodyType: LOCO_BODY_TYPE_BSON,
+          body: { status: 0, chatLogs: [{
+            ...log(1), logId: Long.fromString('9007199254740995'),
+            revision,
+          }], eof: true },
+        }))!
+        mchat.mockResolvedValueOnce(decoded.packet)
+        const [result] = await read(await client())
+        expect(result?.log_id).toBe('9007199254740995')
+        expect(result?.revision).toBe(revision.toString())
+      })
+    }
+
+    it(`${route} rejects unsigned Long overflow after actual BSON decoding as signed negative`, async () => {
+      const decoded = decodePacket(encodePacket({
+        packetId: 1, statusCode: 0, method: 'MCHATLOGS', bodyType: LOCO_BODY_TYPE_BSON,
+        body: { status: 0, chatLogs: [{ ...log(1), revision: Long.MAX_UNSIGNED_VALUE }], eof: true },
+      }))!
+      expect((decoded.packet.body.chatLogs as Array<Record<string, unknown>>)[0]!.revision).toBe(-1)
+      mchat.mockResolvedValueOnce(decoded.packet)
+      const failure = await read(await client()).catch(error => error)
+      expect(route === 'recent' ? failure.cause : failure).toMatchObject({ code: 'message_revision_invalid' })
+      expect(info).not.toHaveBeenCalled()
+      expect(sync).not.toHaveBeenCalled()
+    })
+  }
+
+  it('rejects revisions outside the native signed int64 contract at the exported schema', () => {
+    for (const revision of ['9223372036854775808', '18446744073709551615', '-1', '01']) {
+      expect(KakaoMessageSchema.safeParse({
+        log_id: '1', revision, type: 1, author_id: 1, author_name: null,
+        message: 'synthetic-1', attachment: null, sent_at: 1,
+      }).success).toBe(false)
+    }
+  })
+
+  it('does not turn a malformed revision into legacy history fallback', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [{ ...log(1), revision: -1 }], eof: true }))
+    await expect((await client()).getMessages('100')).rejects.toMatchObject({
+      code: 'get_messages_failed', cause: { code: 'message_revision_invalid' },
+    })
+    expect(info).not.toHaveBeenCalled()
+    expect(sync).not.toHaveBeenCalled()
+    expect(login).toHaveBeenCalledTimes(1)
+  })
+
+  const ids = ['9007199254740993', '9007199254740994', '9007199254740995']
+  const row = (index: number) => ({ ...log(1), logId: Long.fromString(ids[index]!), revision: index, sendAt: 100 })
+
+  it('keeps revisions on the read-only recent suffix across overlapping unordered pages', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [row(1), row(0)], eof: false }))
+      .mockResolvedValueOnce(packet({ chatLogs: [row(2), row(1)], eof: true }))
+    const value = await client()
+    await value.acquireSession()
+    const result = await value.getRecentMessagesReadOnlyOnce('100', { count: 2 })
+    expect(result.map(value => [value.log_id, value.revision])).toEqual([[ids[1], '1'], [ids[2], '2']])
+    expect(mchat.mock.calls.map(call => String(call[1][0]))).toEqual(['0', ids[1]])
+    expect(info).not.toHaveBeenCalled()
+    expect(sync).not.toHaveBeenCalled()
+  })
+
+  it('keeps forward revision ordering, truncation and exact continuation cursor', async () => {
+    mchat.mockResolvedValueOnce(packet({ chatLogs: [row(2), row(0), row(1)], eof: true }))
+      .mockResolvedValueOnce(packet({ chatLogs: [row(2), row(1)], eof: true }))
+    const value = await client()
+    const first = await value.getMessagePage('100', { count: 2 })
+    expect(first.messages.map(message => [message.log_id, message.revision])).toEqual([[ids[0], '0'], [ids[1], '1']])
+    expect(first.next_cursor).toBe(ids[1])
+    expect(first.complete).toBe(false)
+    const next = await value.getMessagePage('100', { from: first.next_cursor!, count: 2 })
+    expect(next.messages.map(message => [message.log_id, message.revision])).toEqual([[ids[2], '2']])
+    expect(next.next_cursor).toBe(ids[2])
+    expect(next.complete).toBe(true)
+    expect(mchat.mock.calls.map(call => String(call[1][0]))).toEqual(['0', ids[1]])
+    expect(info).not.toHaveBeenCalled()
+    expect(sync).not.toHaveBeenCalled()
   })
 })

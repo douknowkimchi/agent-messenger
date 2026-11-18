@@ -1158,20 +1158,20 @@ function formatMessages(
     return a < b ? -1 : a > b ? 1 : 0
   })
 
-  return logs.slice(-count).map((log) => ({
-    log_id: longToString(log.logId),
-    type: log.type as number,
-    author_id: log.authorId as number,
-    author_name: nameCache.lookup(chatId, log.authorId as number),
-    message: log.message as string,
-    attachment: parseAttachmentJson(log.attachment),
-    sent_at: log.sendAt as number,
-  }))
+  return logs.slice(-count).map((log) => formatForwardMessage(log, chatId, nameCache))
 }
 
 function formatForwardMessage(log: Record<string, unknown>, chatId: string, nameCache: MemberNameCache): KakaoMessage {
+  const rawRevision = log.revision
+  const revision = rawRevision == null ? undefined : readStateId(rawRevision)
+  // The shared ID parser is unsigned; revisions are nonnegative signed int64.
+  if (revision === null || (revision !== undefined && BigInt(revision) > MAX_SIGNED_INT64) ||
+      (rawRevision && typeof rawRevision === 'object' && !Long.isLong(rawRevision))) {
+    throw new KakaoTalkError('message_revision_invalid', 'message_revision_invalid')
+  }
   return {
     log_id: longToString(log.logId),
+    ...(revision === undefined ? {} : { revision }),
     type: log.type as number,
     author_id: log.authorId as number,
     author_name: nameCache.lookup(chatId, log.authorId as number),

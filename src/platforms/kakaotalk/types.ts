@@ -118,6 +118,8 @@ export interface KakaoChat {
 
 export interface KakaoMessage {
   log_id: string
+  /** Explicit native nonnegative int64 revision, as exact decimal; absent means unknown. */
+  revision?: string
   type: number
   author_id: number
   author_name: string | null
@@ -415,6 +417,9 @@ export const KakaoChatSchema = z.object({
 
 export const KakaoMessageSchema = z.object({
   log_id: z.string(),
+  revision: z.string()
+    .refine((value) => /^(0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= 9223372036854775807n)
+    .optional(),
   type: z.number(),
   author_id: z.number(),
   author_name: z.string().nullable(),

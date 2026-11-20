@@ -85,3 +85,7 @@ Use the **Release** GitHub Actions workflow (`workflow_dispatch`). It typechecks
 ## Push event names
 
 Every `kakaotalk_event` carries the LOCO packet method as `type`. A push body with its own `type` field keeps that value as `payload_type` (unless the body already has `payload_type`); the body is never spread after the method. The typed events (`message`, `member_joined`, `member_left`, `read`) are unchanged.
+
+## Message reactions (read only)
+
+`reaction-meta.ts` types a CHGLOGMETA push whose metadata type is 1 (the general heart/like/check/laugh/surprise/sad aggregate, content `{"<kind>":count}`) as the listener's `reaction` event: exact decimal `chat_id`, `log_id`, `revision` and optional `link_id`, and the complete type-1 counts sorted by kind (an empty list is a known empty aggregate). The type-2 mini/custom `rx` aggregate, other metadata types and malformed bodies are not typed; every CHGLOGMETA still reaches `kakaotalk_event` unchanged. Ported from frrad/mooo (MIT, see `protocol/NOTICE.md`). No reaction is sent, no members/sync-meta request is made and no past change is restored. Synthetic tests do not establish live provider behavior.

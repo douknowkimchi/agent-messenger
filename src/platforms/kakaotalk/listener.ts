@@ -2,6 +2,7 @@ import { EventEmitter } from 'events'
 
 import { KakaoTalkError, parseAttachmentJson, type KakaoSessionEvent, type KakaoTalkClient } from './client'
 import type { LocoPacket } from './protocol/types'
+import { decodeReactionPush } from './reaction-meta'
 import {
   KAKAO_EMOTICON_KIND_BY_TYPE,
   type KakaoEmoticonMessageType,
@@ -224,6 +225,15 @@ export class KakaoTalkListener {
           watermark: longToString(body.watermark),
         }
         this.emitter.emit('read', event)
+        this.emitter.emit('kakaotalk_event', genericPushEvent(method, body))
+        break
+      }
+
+      case 'CHGLOGMETA': {
+        // Only a well-formed general (type-1) aggregate is typed; every
+        // CHGLOGMETA, typed or not, stays a generic event as before.
+        const reaction = decodeReactionPush(body)
+        if (reaction) this.emitter.emit('reaction', reaction)
         this.emitter.emit('kakaotalk_event', genericPushEvent(method, body))
         break
       }

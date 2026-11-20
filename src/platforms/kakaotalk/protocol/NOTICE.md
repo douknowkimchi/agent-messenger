@@ -110,6 +110,28 @@ target check and never erase a validated prefix or normalize provider refusal.
 
 ---
 
+## mooo general reaction push adaptation (2026-11-20)
+
+- Source: https://github.com/frrad/mooo
+- Exact commit: `a638e2447677510ba31766cfae35863b57487550`
+- License: MIT, Copyright (c) 2026 Frederick. The full license text is kept
+  at the top of `../reaction-meta.ts`, which ships with the build.
+- File adapted (Go to TypeScript, modified): `internal/protocol/events/events.go`
+  (`decodeLogMeta` and the type-1 branch of `logMetaEvent`).
+- Protocol references read: `research/replies-and-reactions.md`,
+  `research/bridge/REACTION-COMPATIBILITY.md`.
+
+Disposition: **BEHAVIOR_PORT**. Deliberate differences: only the type-1
+aggregate is typed; a type-2 (mini/custom) or unknown metadata type, or any
+malformed field, yields no typed event instead of an unsupported/error value,
+and the generic push is kept either way. Ids are exact decimal strings of
+positive signed int64 values as the BSON decoder delivers them (number or
+Long); `extra` (own pick and one actor) is not exposed. Members, details and
+sync-meta HTTP reads and reaction mutation were not imported. The donor was not
+executed here.
+
+---
+
 ## mooo SHIP-redirect media upload adaptation (2026-11-12)
 
 - Source: https://github.com/frrad/mooo

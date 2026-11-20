@@ -410,7 +410,7 @@ function readStateId(value: unknown): string | null {
 
 const MAX_SIGNED_INT64 = 9223372036854775807n
 
-function positiveSignedInt64String(value: unknown): string | null {
+export function positiveSignedInt64String(value: unknown): string | null {
   const normalized = readStateId(value)
   if (normalized === null) return null
   const id = BigInt(normalized)

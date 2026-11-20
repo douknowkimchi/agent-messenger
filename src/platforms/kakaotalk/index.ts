@@ -54,6 +54,9 @@ export type {
   KakaoTalkPushGenericEvent,
   KakaoTalkPushMemberEvent,
   KakaoTalkPushMessageEvent,
+  KakaoTalkPushReactionEvent,
+  KakaoReactionCount,
+  KakaoReactionKind,
   KakaoTalkPushReadEvent,
   KakaoTypingResult,
 } from './types'

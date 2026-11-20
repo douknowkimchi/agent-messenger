@@ -60,6 +60,12 @@ describe('decodeReactionPush', () => {
     expect(event).toMatchObject({ chat_id: '11', log_id: '12', revision: '13', link_id: '8000000000000000001' })
   })
 
+  it('keeps 2^53, which the decoder delivers as an exact number', () => {
+    const body = wire(legacy({ revision: Long.fromString('9007199254740992'), logId: Long.fromString('9007199254740993') }))
+    expect(typeof body.revision).toBe('number')
+    expect(decodeReactionPush(body)).toMatchObject({ revision: '9007199254740992', log_id: '9007199254740993' })
+  })
+
   it('treats an absent, null or zero link id as a direct chat', () => {
     for (const linkId of [undefined, null, 0, Long.fromNumber(0)]) {
       const body = legacy(linkId === undefined ? {} : { linkId })

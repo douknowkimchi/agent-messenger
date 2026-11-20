@@ -35,10 +35,14 @@ import type { KakaoReactionCount, KakaoReactionKind, KakaoTalkPushReactionEvent 
 
 const KIND_KEYS = new Set(['1', '2', '3', '4', '5', '6'])
 
-// A BSON integer as the packet decoder delivers it: a number, or a Long when
-// it is not a safe integer. Strings and other shapes are not wire integers.
+// A BSON integer as the packet decoder delivers it: a number up to 2^53
+// (exact, though 2^53 itself is not a safe integer), or a Long beyond that.
+// Strings and other shapes are not wire integers.
 function wireId(value: unknown): string | null {
-  return typeof value === 'number' || Long.isLong(value) ? positiveSignedInt64String(value) : null
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value > 0 && value <= 2 ** 53 ? BigInt(value).toString() : null
+  }
+  return Long.isLong(value) ? positiveSignedInt64String(value) : null
 }
 
 /**

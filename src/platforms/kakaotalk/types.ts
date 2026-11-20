@@ -635,11 +635,35 @@ export interface KakaoTalkPushGenericEvent {
   [key: string]: unknown
 }
 
+/** A general reaction: 1 heart, 2 like, 3 check, 4 laugh, 5 surprise, 6 sad. */
+export type KakaoReactionKind = 1 | 2 | 3 | 4 | 5 | 6
+
+export interface KakaoReactionCount {
+  kind: KakaoReactionKind
+  count: number
+}
+
+/**
+ * The current general (type-1) reaction counts of one message, from a
+ * CHGLOGMETA push. `revision` orders changes of one chat; `reactions` is the
+ * complete general aggregate at that revision, sorted by kind (an empty list
+ * is a known empty aggregate). Mini/custom (type-2) items are not included.
+ */
+export interface KakaoTalkPushReactionEvent {
+  type: 'CHGLOGMETA'
+  chat_id: string
+  log_id: string
+  link_id: string | null
+  revision: string
+  reactions: KakaoReactionCount[]
+}
+
 export type KakaoTalkPushEvent =
   | KakaoTalkPushMessageEvent
   | KakaoTalkPushEmoticonEvent
   | KakaoTalkPushMemberEvent
   | KakaoTalkPushReadEvent
+  | KakaoTalkPushReactionEvent
   | KakaoTalkPushGenericEvent
 
 export interface KakaoTalkListenerEventMap {
@@ -648,6 +672,7 @@ export interface KakaoTalkListenerEventMap {
   member_joined: [event: KakaoTalkPushMemberEvent]
   member_left: [event: KakaoTalkPushMemberEvent]
   read: [event: KakaoTalkPushReadEvent]
+  reaction: [event: KakaoTalkPushReactionEvent]
   kakaotalk_event: [event: KakaoTalkPushGenericEvent]
   connected: [info: { userId: string }]
   disconnected: []

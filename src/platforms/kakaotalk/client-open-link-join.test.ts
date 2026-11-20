@@ -162,10 +162,16 @@ describe('KakaoTalkClient own open profiles', () => {
 })
 
 describe('KakaoTalkClient open link passcode', () => {
-  it('reads USE_PASSCODE (64) from the privilege mask beside ANY_PROFILE_ALLOWED (32)', async () => {
-    const { client } = fixture([{ body: { status: 0, ol: ol({ pv: Long.fromNumber(64) }) } }])
-    await expect(client.getOpenLinkJoinInfoOnce(URL)).resolves.toMatchObject({ any_profile_allowed: false, passcode_required: true })
-  })
+  for (const [label, pv, any, passcode] of [
+    ['Long 64', Long.fromNumber(64), false, true], ['number 64', 64, false, true], ['number 96', 96, true, true],
+    ['number 32', 32, true, false], ['Long above 2^53 with 64', Long.fromString('9007199254741056'), false, true],
+    ['negative', -64, null, null],
+  ] as const) {
+    it(`reads USE_PASSCODE (64) beside ANY_PROFILE_ALLOWED (32) from ${label}`, async () => {
+      const { client } = fixture([{ body: { status: 0, ol: ol({ pv }) } }])
+      await expect(client.getOpenLinkJoinInfoOnce(URL)).resolves.toMatchObject({ any_profile_allowed: any, passcode_required: passcode })
+    })
+  }
 
   it('checks one passcode with CHECKJOIN { li, pc } and returns its token, joining nothing', async () => {
     const { client, sent } = fixture([{ body: { status: 0, tk: 'tok-123' } }])
@@ -173,6 +179,7 @@ describe('KakaoTalkClient open link passcode', () => {
     expect(sent).toHaveLength(1)
     expect(sent[0].method).toBe('CHECKJOIN')
     expect(Object.keys(sent[0].body).sort()).toEqual(['li', 'pc'])
+    expect(sent[0].body.li).toBeInstanceOf(Long)
     expect((sent[0].body.li as Long).toString()).toBe(LINK)
     expect(sent[0].body.pc).toBe('1234')
   })
@@ -207,7 +214,10 @@ describe('KakaoTalkClient open link passcode', () => {
     const plain = fixture([answer])
     Object.assign(plain.client, { acquireSession: async () => (plain.client as unknown as { state: { session: LocoSession } }).state.session })
     await plain.client.joinOpenDirectOnce(LINK, { kind: 'main' })
-    expect('tk' in plain.sent[0].body).toBe(false)
+    expect(Object.keys(plain.sent[0].body)).toEqual(['li', 'ref', 'ptp'])
+    expect(plain.sent[0].body.li).toBeInstanceOf(Long)
+    expect([(plain.sent[0].body.li as Long).toString(), plain.sent[0].body.ref, plain.sent[0].body.ptp]).toEqual([LINK, 'EW:', 1])
+    expect(Object.keys(withToken.sent[0].body)).toEqual(['li', 'ref', 'ptp', 'tk'])
     const bad = fixture([])
     await expect(bad.client.joinOpenDirectOnce(LINK, { kind: 'main' }, { token: 'has space' })).rejects.toMatchObject({ code: 'invalid_open_join_token' })
     expect(bad.sent).toHaveLength(0)

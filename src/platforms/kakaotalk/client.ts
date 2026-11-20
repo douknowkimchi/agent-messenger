@@ -19,7 +19,6 @@ import {
   sendSingleMedia,
 } from './media-send'
 import { sha1Hex } from './media-upload'
-import { LANG, PC_OS_NAME, getLocoDeviceConfig } from './protocol/config'
 import {
   type BubbleReactionKind,
   type BubbleReactionMembers,
@@ -27,8 +26,9 @@ import {
   getBubbleReactionMembers,
   setBubbleReactionOnce,
 } from './protocol/bubble-reactions'
-import { directHeaders } from './protocol/media-direct'
+import { LANG, PC_OS_NAME, getLocoDeviceConfig } from './protocol/config'
 import { isSyntheticConnectionClose } from './protocol/login-response'
+import { directHeaders } from './protocol/media-direct'
 import { type MediaSendPhase, MediaStepError } from './protocol/media-outcome'
 import { LocoSession } from './protocol/session'
 import type { ChatListResponse, LocoPacket, LoginListResponse, SyncState } from './protocol/types'

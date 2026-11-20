@@ -15,8 +15,16 @@ function fixture(answer: () => Response, signedIn = true) {
     userId: signedIn ? '4242' : null,
     deviceUuid: DEVICE,
     deviceType: 'tablet',
-    mediaIo: { fetch: async (url: string, init: RequestInit) => { calls.push({ url, init }); return answer() } },
-    ensureSession: async () => { sessions++; throw new Error('no LOCO session is used') },
+    mediaIo: {
+      fetch: async (url: string, init: RequestInit) => {
+        calls.push({ url, init })
+        return answer()
+      },
+    },
+    ensureSession: async () => {
+      sessions++
+      throw new Error('no LOCO session is used')
+    },
   })
   return { client, calls, sessions: () => sessions }
 }

@@ -13,7 +13,10 @@ const TOKEN_HEADERS = { Authorization: 'synthetic-token-device', A: 'win32/26.0.
 const BIG_CHAT = '9223372036854775801'
 const BIG_LOG = '9007199254740993' // 2^53 + 1: not representable as a JavaScript number
 
-interface Call { url: string; init: RequestInit }
+interface Call {
+  url: string
+  init: RequestInit
+}
 
 function fakeHttp(answer: () => Promise<Response> | Response): { http: BubbleReactionHttp; calls: Call[] } {
   const calls: Call[] = []
@@ -30,7 +33,8 @@ function fakeHttp(answer: () => Promise<Response> | Response): { http: BubbleRea
   }
 }
 
-const json = (status: number, body: string) => new Response(body, { status, headers: { 'content-type': 'application/json' } })
+const json = (status: number, body: string) =>
+  new Response(body, { status, headers: { 'content-type': 'application/json' } })
 
 describe('setBubbleReactionOnce', () => {
   it('posts the exact log id digits once to the chat path, without following redirects', async () => {
@@ -55,8 +59,15 @@ describe('setBubbleReactionOnce', () => {
   it('refuses invalid input before any request', async () => {
     const { http, calls } = fakeHttp(() => json(200, '{"status":0}'))
     for (const [chat, log, kind, req] of [
-      ['0', '1', 1, 1], ['01', '1', 1, 1], ['1', '9223372036854775808', 1, 1], ['1', '-1', 1, 1],
-      ['1', '1', 7, 1], ['1', '1', -1, 1], ['1', '1', 1.5, 1], ['1', '1', 1, 0], ['1', '1', 1, Number.MAX_SAFE_INTEGER + 1],
+      ['0', '1', 1, 1],
+      ['01', '1', 1, 1],
+      ['1', '9223372036854775808', 1, 1],
+      ['1', '-1', 1, 1],
+      ['1', '1', 7, 1],
+      ['1', '1', -1, 1],
+      ['1', '1', 1.5, 1],
+      ['1', '1', 1, 0],
+      ['1', '1', 1, Number.MAX_SAFE_INTEGER + 1],
     ] as const) {
       expect(await setBubbleReactionOnce(http, chat, log, kind as never, req)).toEqual({ outcome: 'not_sent' })
     }
@@ -71,7 +82,10 @@ describe('setBubbleReactionOnce', () => {
       [() => json(200, '{"result":false}'), { outcome: 'rejected', providerStatus: null }],
       [() => json(403, '{"status":-401}'), { outcome: 'rejected', providerStatus: null }],
       [() => json(500, '{"status":0}'), { outcome: 'unknown' }],
-      [() => new Response(null, { status: 302, headers: { location: 'https://example.invalid/' } }), { outcome: 'unknown' }],
+      [
+        () => new Response(null, { status: 302, headers: { location: 'https://example.invalid/' } }),
+        { outcome: 'unknown' },
+      ],
       [() => json(200, '{}'), { outcome: 'unknown' }],
       [() => json(200, '{"status":"0"}'), { outcome: 'unknown' }],
       [() => json(200, '{"status":0,"status":1}'), { outcome: 'unknown' }],
@@ -98,10 +112,13 @@ describe('setBubbleReactionOnce', () => {
 describe('members', () => {
   it('reads every id exactly, including ids above 2^53', async () => {
     const { http, calls } = fakeHttp(() =>
-      json(200, `{"revision":9223372036854775806, "1" : [${BIG_LOG},20002],"3":[],"7":[1],"other":{"a":1.5,"s":"#1"}}`))
+      json(200, `{"revision":9223372036854775806, "1" : [${BIG_LOG},20002],"3":[],"7":[1],"other":{"a":1.5,"s":"#1"}}`),
+    )
     const read = await getBubbleReactionMembers(http, BIG_CHAT, BIG_LOG)
     expect(calls).toHaveLength(1)
-    expect(calls[0]!.url).toBe(`https://talk-pilsner.kakao.com/messaging/chats/${BIG_CHAT}/bubble/reactions/${BIG_LOG}/members`)
+    expect(calls[0]!.url).toBe(
+      `https://talk-pilsner.kakao.com/messaging/chats/${BIG_CHAT}/bubble/reactions/${BIG_LOG}/members`,
+    )
     expect(calls[0]!.init.method).toBe('GET')
     expect(calls[0]!.init.redirect).toBe('manual')
     expect(read).toEqual({
@@ -113,16 +130,33 @@ describe('members', () => {
   it('treats a missing or zero revision as null and an empty answer as confirmed empty', () => {
     expect(decodeBubbleReactionMembers('{}').revision).toBeNull()
     expect(decodeBubbleReactionMembers('{"revision":0,"1":[],"note":"x"}')).toEqual({
-      revision: null, members: { '1': [], '2': [], '3': [], '4': [], '5': [], '6': [] },
+      revision: null,
+      members: { '1': [], '2': [], '3': [], '4': [], '5': [], '6': [] },
     })
   })
 
   it('fails the whole answer on any malformed general kind', () => {
     for (const body of [
-      '{"1":"20002"}', '{"1":[0]}', '{"1":[-5]}', '{"1":["20002"]}', '{"1":[1.5]}', '{"1":[9223372036854775808]}',
-      '{"1":[20002],"2":[20002]}', '{"1":[20002,20002]}', '{"revision":-1}', '{"revision":"3"}', '{"1":[1],"1":[2]}',
-      '[1]', 'nope', '{"1":null}', '{"revision":null}', '{"revision":"#9","1":["#4242"]}', '{"1":["#4242"]}',
-      '{"revision":"#9"}', '{"1":[{"a":1}]}', '{"1":[true]}',
+      '{"1":"20002"}',
+      '{"1":[0]}',
+      '{"1":[-5]}',
+      '{"1":["20002"]}',
+      '{"1":[1.5]}',
+      '{"1":[9223372036854775808]}',
+      '{"1":[20002],"2":[20002]}',
+      '{"1":[20002,20002]}',
+      '{"revision":-1}',
+      '{"revision":"3"}',
+      '{"1":[1],"1":[2]}',
+      '[1]',
+      'nope',
+      '{"1":null}',
+      '{"revision":null}',
+      '{"revision":"#9","1":["#4242"]}',
+      '{"1":["#4242"]}',
+      '{"revision":"#9"}',
+      '{"1":[{"a":1}]}',
+      '{"1":[true]}',
     ]) {
       expect(() => decodeBubbleReactionMembers(body)).toThrow(BubbleReactionReadError)
     }

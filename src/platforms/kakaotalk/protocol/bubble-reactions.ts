@@ -124,7 +124,13 @@ export async function setBubbleReactionOnce(
   kind: BubbleReactionKind,
   requestId: number,
 ): Promise<BubbleReactionOutcome> {
-  if (!canonicalId(chatId) || !canonicalId(logId) || !isKind(kind) || !Number.isSafeInteger(requestId) || requestId <= 0) {
+  if (
+    !canonicalId(chatId) ||
+    !canonicalId(logId) ||
+    !isKind(kind) ||
+    !Number.isSafeInteger(requestId) ||
+    requestId <= 0
+  ) {
     return { outcome: 'not_sent' }
   }
   const body = `{"logId":${logId},"type":${kind},"reqId":${requestId}}`

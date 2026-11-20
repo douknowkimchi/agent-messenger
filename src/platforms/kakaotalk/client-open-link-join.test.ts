@@ -44,6 +44,7 @@ describe('KakaoTalkClient open link invite preview', () => {
     await expect(client.getOpenLinkJoinInfoOnce(URL)).resolves.toEqual({
       link_id: LINK, link_type: 2, active: true, owner_user_id: '9007199254740995', any_profile_allowed: true,
       link_url: URL, name: 'Synthetic room', description: 'about', owner_nickname: 'Host', member_limit: 300,
+      passcode_required: false,
     })
     expect(sent).toEqual([{ method: 'JOININFO', body: { lu: URL, ref: 'EW' } }])
   })
@@ -86,7 +87,7 @@ describe('KakaoTalkClient open link invite preview', () => {
   it('reports optional fields it cannot use as null and an answered URL as answered', async () => {
     const { client } = fixture([{ body: { status: 0, ol: ol({ lu: 'https://example.com/o/x', desc: 3, ml: -1, pv: undefined, olu: { userId: 7 } }) } }])
     await expect(client.getOpenLinkJoinInfoOnce(URL)).resolves.toMatchObject({
-      link_url: 'https://example.com/o/x', description: null, member_limit: null, any_profile_allowed: null, owner_nickname: null, owner_user_id: '7',
+      link_url: 'https://example.com/o/x', description: null, member_limit: null, any_profile_allowed: null, passcode_required: null, owner_nickname: null, owner_user_id: '7',
     })
     const absent = fixture([{ body: { status: 0, ol: ol({ lu: undefined }) } }])
     await expect(absent.client.getOpenLinkJoinInfoOnce(URL)).resolves.toMatchObject({ link_url: null })
@@ -157,5 +158,68 @@ describe('KakaoTalkClient own open profiles', () => {
     await expect(client.listOwnOpenProfilesOnce()).rejects.toMatchObject({
       code: 'list_own_open_profiles_failed', responseFailureKind: 'provider_rejection', serverStatus: -500,
     })
+  })
+})
+
+describe('KakaoTalkClient open link passcode', () => {
+  for (const [label, pv, any, passcode] of [
+    ['Long 64', Long.fromNumber(64), false, true], ['number 64', 64, false, true], ['number 96', 96, true, true],
+    ['number 32', 32, true, false], ['Long above 2^53 with 64', Long.fromString('9007199254741056'), false, true],
+    ['negative', -64, null, null],
+  ] as const) {
+    it(`reads USE_PASSCODE (64) beside ANY_PROFILE_ALLOWED (32) from ${label}`, async () => {
+      const { client } = fixture([{ body: { status: 0, ol: ol({ pv }) } }])
+      await expect(client.getOpenLinkJoinInfoOnce(URL)).resolves.toMatchObject({ any_profile_allowed: any, passcode_required: passcode })
+    })
+  }
+
+  it('checks one passcode with CHECKJOIN { li, pc } and returns its token, joining nothing', async () => {
+    const { client, sent } = fixture([{ body: { status: 0, tk: 'tok-123' } }])
+    await expect(client.checkOpenLinkPasscodeOnce(LINK, '1234')).resolves.toEqual({ status_code: 0, token: 'tok-123' })
+    expect(sent).toHaveLength(1)
+    expect(sent[0].method).toBe('CHECKJOIN')
+    expect(Object.keys(sent[0].body).sort()).toEqual(['li', 'pc'])
+    expect(sent[0].body.li).toBeInstanceOf(Long)
+    expect((sent[0].body.li as Long).toString()).toBe(LINK)
+    expect(sent[0].body.pc).toBe('1234')
+  })
+
+  it('keeps a refused passcode as its status with no token, and refuses a token-less success as unknown', async () => {
+    const refused = fixture([{ body: { status: -331 } }])
+    await expect(refused.client.checkOpenLinkPasscodeOnce(LINK, '0000')).resolves.toEqual({ status_code: -331, token: null })
+    const empty = fixture([{ body: { status: 0 } }])
+    await expect(empty.client.checkOpenLinkPasscodeOnce(LINK, '0000')).rejects.toMatchObject({ code: 'check_open_link_passcode_failed' })
+    expect(empty.sent).toHaveLength(1)
+  })
+
+  for (const passcode of ['', 'a'.repeat(65), 'a\u0000b']) {
+    it(`sends nothing for an unusable passcode (${passcode.length} chars)`, async () => {
+      const { client, sent } = fixture([])
+      await expect(client.checkOpenLinkPasscodeOnce(LINK, passcode)).rejects.toMatchObject({ code: 'invalid_open_link_passcode' })
+      expect(sent).toHaveLength(0)
+    })
+  }
+
+  it('never acquires a session for a passcode check', async () => {
+    const client = new KakaoTalkClient()
+    await expect(client.checkOpenLinkPasscodeOnce(LINK, '1234')).rejects.toMatchObject({ code: 'check_open_link_passcode_failed' })
+  })
+
+  it('carries the checked token on the one JOINLINK as tk, and nothing for a join without one', async () => {
+    const answer = { body: { status: 0, chatRoom: { chatId: Long.fromString('9223372036854775701'), type: 'OM' }, ol: { li: Long.fromString(LINK) } } }
+    const withToken = fixture([answer])
+    Object.assign(withToken.client, { acquireSession: async () => (withToken.client as unknown as { state: { session: LocoSession } }).state.session })
+    await withToken.client.joinOpenDirectOnce(LINK, { kind: 'main' }, { token: 'tok-123' })
+    expect(withToken.sent.map(item => [item.method, item.body.tk, item.body.ref, item.body.ptp])).toEqual([['JOINLINK', 'tok-123', 'EW:', 1]])
+    const plain = fixture([answer])
+    Object.assign(plain.client, { acquireSession: async () => (plain.client as unknown as { state: { session: LocoSession } }).state.session })
+    await plain.client.joinOpenDirectOnce(LINK, { kind: 'main' })
+    expect(Object.keys(plain.sent[0].body)).toEqual(['li', 'ref', 'ptp'])
+    expect(plain.sent[0].body.li).toBeInstanceOf(Long)
+    expect([(plain.sent[0].body.li as Long).toString(), plain.sent[0].body.ref, plain.sent[0].body.ptp]).toEqual([LINK, 'EW:', 1])
+    expect(Object.keys(withToken.sent[0].body)).toEqual(['li', 'ref', 'ptp', 'tk'])
+    const bad = fixture([])
+    await expect(bad.client.joinOpenDirectOnce(LINK, { kind: 'main' }, { token: 'has space' })).rejects.toMatchObject({ code: 'invalid_open_join_token' })
+    expect(bad.sent).toHaveLength(0)
   })
 })

@@ -219,6 +219,17 @@ export interface KakaoOpenLinkJoinInfo extends KakaoOpenLink {
   owner_nickname: string | null
   /** ml (open chat member limit) when a positive integer; else null. */
   member_limit: number | null
+  /** pv USE_PASSCODE (64): a join needs the link's passcode first; null without a usable mask. */
+  passcode_required: boolean | null
+}
+
+/**
+ * One CHECKJOIN answer for a passcode link: a refusal keeps Kakao's status and
+ * no token; status 0 carries the join token JOINLINK then takes as tk.
+ */
+export interface KakaoOpenLinkPasscodeCheck {
+  status_code: number
+  token: string | null
 }
 
 /** One open profile this account owns (SYNCLINK, link type 1, active). */

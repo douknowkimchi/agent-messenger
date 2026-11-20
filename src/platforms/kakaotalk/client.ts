@@ -50,6 +50,8 @@ import {
   type KakaoMessagePage,
   type KakaoOpenJoinProfile,
   type KakaoOpenLink,
+  type KakaoOpenLinkJoinInfo,
+  type KakaoOwnOpenProfile,
   type KakaoOpenSelfProfile,
   type KakaoProfile,
   type KakaoReadWatermarks,
@@ -417,6 +419,16 @@ function readStateId(value: unknown): string | null {
 }
 
 const MAX_SIGNED_INT64 = 9223372036854775807n
+
+// An exact shared open chat invite: https://open.kakao.com/o/<code>, with no
+// query, fragment, port or further path. Only such a URL is sent as JOININFO lu.
+const OPEN_INVITE_URL = /^https:\/\/open\.kakao\.com\/o\/[A-Za-z0-9]{4,32}$/
+const OPEN_LINK_TEXT_MAX = 4000
+const OWN_OPEN_LINKS_MAX = 500
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
 
 export function positiveSignedInt64String(value: unknown): string | null {
   const normalized = readStateId(value)
@@ -2989,8 +3001,9 @@ export class KakaoTalkClient {
   }
 
   /**
-   * Join one open profile link (JOINLINK) with the given profile of this
-   * account, at most once: one ready session, one packet, never through
+   * Join one open link (JOINLINK) — an open profile link or a shared invite's
+   * channel link — with the given profile of this account, at most once: one
+   * ready session, one packet, never through
    * executeWithReconnect. Only the body status is Kakao's answer: a non-zero
    * integer body status is a refusal; zero with a zero header and a canonical
    * chatRoom.chatId is a join whose room and link the caller must still verify.
@@ -3052,6 +3065,109 @@ export class KakaoTalkClient {
     } catch (error) {
       throw wrapError(error, 'join_open_direct_unknown', { classifyResponseFailure: true })
     }
+  }
+
+  /**
+   * Read the open link one shared invite URL names (JOININFO), once, on the
+   * current ready session: no acquire, reconnect or retry, and nothing is
+   * joined. Only an exact https://open.kakao.com/o/<code> URL is asked. The
+   * answer must name one link with a canonical id, type, activation, owner and
+   * name; anything else is refused and nothing is filled in. A provider
+   * refusal keeps its status (responseFailureKind provider_rejection).
+   */
+  async getOpenLinkJoinInfoOnce(url: string, options: { signal?: AbortSignal } = {}): Promise<KakaoOpenLinkJoinInfo> {
+    if (typeof url !== 'string' || !OPEN_INVITE_URL.test(url)) {
+      throw new KakaoTalkError('Invalid open link invite URL', 'invalid_open_link_url')
+    }
+    const { session, check } = this.captureReadySession(options.signal, 'get_open_link_join_info_failed')
+    try {
+      const response = await session.getOpenLinkJoinInfo(url)
+      check()
+      if (response.statusCode === 0 && !isPlainRecord(response.body)) throw new Error('JOININFO response invalid body')
+      assertLocoOk(response, 'JOININFO')
+      // donor getJoinInfo accepts only an explicit success status.
+      if (response.body.status !== 0) throw new Error('JOININFO response status missing')
+      const ol = response.body.ol
+      if (!isPlainRecord(ol)) throw new Error('JOININFO response invalid link')
+      const linkId = positiveSignedInt64String(ol.li)
+      if (linkId === null) throw new Error('JOININFO response invalid link id')
+      if (typeof ol.lt !== 'number' || !Number.isSafeInteger(ol.lt)) throw new Error('JOININFO response invalid type')
+      if (typeof ol.ac !== 'boolean') throw new Error('JOININFO response invalid activation')
+      const owner = isPlainRecord(ol.olu) ? memberIdKey(ol.olu) : null
+      if (owner === null) throw new Error('JOININFO response invalid owner')
+      if (typeof ol.ln !== 'string' || ol.ln.length > OPEN_LINK_TEXT_MAX) throw new Error('JOININFO response invalid name')
+      if (ol.lu !== undefined && ol.lu !== null && (typeof ol.lu !== 'string' || ol.lu.length > OPEN_LINK_TEXT_MAX)) {
+        throw new Error('JOININFO response invalid link url')
+      }
+      return {
+        link_id: linkId, link_type: ol.lt, active: ol.ac, owner_user_id: owner,
+        any_profile_allowed: anyProfileAllowed(ol.pv),
+        // As answered: the caller compares it with the asked invite.
+        link_url: typeof ol.lu === 'string' ? ol.lu : null,
+        name: ol.ln,
+        description: typeof ol.desc === 'string' && ol.desc.length <= OPEN_LINK_TEXT_MAX ? ol.desc : null,
+        owner_nickname: isPlainRecord(ol.olu) && validNickname(ol.olu.nn) ? ol.olu.nn : null,
+        member_limit: typeof ol.ml === 'number' && Number.isSafeInteger(ol.ml) && ol.ml > 0 ? ol.ml : null,
+      }
+    } catch (error) {
+      throw wrapError(error, 'get_open_link_join_info_failed', { classifyResponseFailure: true })
+    }
+  }
+
+  /**
+   * The active open profiles this account owns (SYNCLINK from token 0), once,
+   * on the current ready session; no acquire, reconnect or retry. Links of
+   * another type, inactive ones and ones another user owns are left out. An
+   * answer without ols is an empty list; a malformed entry refuses the whole
+   * answer. This is the list as Kakao answered it, not a proved inventory.
+   */
+  async listOwnOpenProfilesOnce(options: { signal?: AbortSignal } = {}): Promise<KakaoOwnOpenProfile[]> {
+    const { session, check } = this.captureReadySession(options.signal, 'list_own_open_profiles_failed')
+    const self = this.userId
+    try {
+      const response = await session.syncOpenLinks(0)
+      check()
+      if (response.statusCode === 0 && !isPlainRecord(response.body)) throw new Error('SYNCLINK response invalid body')
+      assertLocoOk(response, 'SYNCLINK')
+      // donor getLatestLinkList accepts only an explicit success status.
+      if (response.body.status !== 0) throw new Error('SYNCLINK response status missing')
+      const ols = response.body.ols
+      if (ols === undefined || ols === null) return []
+      if (!Array.isArray(ols) || ols.length > OWN_OPEN_LINKS_MAX) throw new Error('SYNCLINK response invalid list')
+      const profiles: KakaoOwnOpenProfile[] = []
+      const seen = new Set<string>()
+      for (const item of ols) {
+        if (!isPlainRecord(item)) throw new Error('SYNCLINK response invalid link')
+        const linkId = positiveSignedInt64String(item.li)
+        const owner = isPlainRecord(item.olu) ? memberIdKey(item.olu) : null
+        if (linkId === null || typeof item.lt !== 'number' || typeof item.ac !== 'boolean' || owner === null ||
+          typeof item.ln !== 'string' || item.ln.length > OPEN_LINK_TEXT_MAX || seen.has(linkId)) {
+          throw new Error('SYNCLINK response invalid link')
+        }
+        seen.add(linkId)
+        if (item.lt !== 1 || item.ac !== true || owner !== self) continue
+        profiles.push({ link_id: linkId, name: item.ln,
+          nickname: isPlainRecord(item.olu) && validNickname(item.olu.nn) ? item.olu.nn : null })
+      }
+      return profiles
+    } catch (error) {
+      throw wrapError(error, 'list_own_open_profiles_failed', { classifyResponseFailure: true })
+    }
+  }
+
+  // The current ready session, captured once; check() refuses a cancelled
+  // call and a session replaced or closed meanwhile. Never acquires one.
+  private captureReadySession(signal: AbortSignal | undefined, code: string): { session: LocoSession; check: () => void } {
+    const state = this.state
+    const session = state?.session
+    const check = () => {
+      signal?.throwIfAborted()
+      if (!state || !session || this.closed || this.state !== state || this.state.session !== session) {
+        throw new KakaoTalkError('Open link session unavailable or replaced', code)
+      }
+    }
+    check()
+    return { session: session!, check }
   }
 
   /**

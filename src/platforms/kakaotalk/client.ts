@@ -19,8 +19,16 @@ import {
   sendSingleMedia,
 } from './media-send'
 import { sha1Hex } from './media-upload'
+import {
+  type BubbleReactionKind,
+  type BubbleReactionMembers,
+  type BubbleReactionOutcome,
+  getBubbleReactionMembers,
+  setBubbleReactionOnce,
+} from './protocol/bubble-reactions'
 import { LANG, PC_OS_NAME, getLocoDeviceConfig } from './protocol/config'
 import { isSyntheticConnectionClose } from './protocol/login-response'
+import { directHeaders } from './protocol/media-direct'
 import { type MediaSendPhase, MediaStepError } from './protocol/media-outcome'
 import { LocoSession } from './protocol/session'
 import type { ChatListResponse, LocoPacket, LoginListResponse, SyncState } from './protocol/types'
@@ -2839,6 +2847,44 @@ export class KakaoTalkClient {
     } finally {
       this.mediaCloses.delete(closed)
     }
+  }
+
+  // The bubble-reaction HTTP identity: the account's REST headers with the
+  // same talk-* additions the media HTTP upload sends to talk-pilsner.
+  private bubbleReactionHttp() {
+    this.ensureAuth()
+    if (this.closed) throw new KakaoTalkError('Client is closed', 'client_closed')
+    if (this.userId === null) throw new KakaoTalkError('Not authenticated. Call .login() first.', 'not_authenticated')
+    const device = getLocoDeviceConfig(this.deviceType)
+    return {
+      fetch: this.mediaIo.fetch ?? ((input: string, init: RequestInit) => globalThis.fetch(input, init)),
+      authorizedHeaders: directHeaders(this.accountRestHeaders(), {
+        agent: `${device.os === 'mac' ? 'macos' : device.os}/${device.appVersion}`,
+        userId: this.userId,
+        language: LANG,
+      }).authorizedHeaders,
+    }
+  }
+
+  /**
+   * Sets (kind 1..6) or cancels (kind 0) this account's general reaction on
+   * one message of a direct or normal group chat, with exactly one HTTP
+   * request. It never retries and never uses the LOCO session; an unknown
+   * outcome must not be resent by the caller either.
+   */
+  async setBubbleReactionOnce(chatId: string, logId: string, kind: BubbleReactionKind): Promise<BubbleReactionOutcome> {
+    let http
+    try {
+      http = this.bubbleReactionHttp()
+    } catch {
+      return { outcome: 'not_sent' }
+    }
+    return setBubbleReactionOnce(http, chatId, logId, kind, Date.now())
+  }
+
+  /** The current general reaction members of one message, read once. */
+  async getBubbleReactionMembers(chatId: string, logId: string): Promise<BubbleReactionMembers> {
+    return getBubbleReactionMembers(this.bubbleReactionHttp(), chatId, logId)
   }
 
   // The account's REST identity, shared by getProfile and the media HTTP upload.

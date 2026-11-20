@@ -232,7 +232,7 @@ function repeatsKey(text: string): boolean {
 }
 
 /** Exactly one JSON object in which no object repeats a key, else null. */
-function parseObject(text: string): Record<string, unknown> | null {
+export function parseObject(text: string): Record<string, unknown> | null {
   let value: unknown
   try {
     value = JSON.parse(text)
@@ -255,7 +255,7 @@ function requireChatId(chatId: string, phase: 'prepare' | 'ready'): void {
   }
 }
 
-async function boundedText(response: Response): Promise<string> {
+export async function boundedText(response: Response): Promise<string> {
   if (!response.body) return ''
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []

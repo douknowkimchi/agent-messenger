@@ -42,7 +42,7 @@ Referenced for: LOCO packet format, BSON command schemas, authentication flow,
 Android OAuth refresh request/response behavior, X-VC signature algorithm,
 channel/chat type enumerations, and (revision
 8512e4699e2cd4c26516b80d38b57b2f85a6cc8a) the open link JOININFO `{ lu, ref }`,
-SYNCLINK `{ ltk }` and JOINLINK request and response fields.
+SYNCLINK `{ ltk }`, CHECKJOIN `{ li, pc }` → `tk` and JOINLINK request and response fields.
 
 ---
 

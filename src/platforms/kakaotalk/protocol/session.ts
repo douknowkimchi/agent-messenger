@@ -76,9 +76,13 @@ export const JOIN_OPEN_LINK_METHOD = 'JOINLINK'
 
 export type OpenJoinProfileWire = { ptp: 1 } | { ptp: 16; pli: Long } | { ptp: 2; nn: string; pp: string }
 
-export function buildJoinOpenLinkBody(linkId: Long, profile: OpenJoinProfileWire): Record<string, unknown> {
-  return { li: linkId, ref: 'EW:', ...profile }
+export function buildJoinOpenLinkBody(linkId: Long, profile: OpenJoinProfileWire, token?: string): Record<string, unknown> {
+  return { li: linkId, ref: 'EW:', ...profile, ...(token === undefined ? {} : { tk: token }) }
 }
+
+// A passcode link (node-kakao 8512e469 TalkOpenChannelSession.joinChannel):
+// CHECKJOIN { li, pc } answers the token JOINLINK then carries as tk.
+export const OPEN_LINK_PASSCODE_METHOD = 'CHECKJOIN'
 
 // Read-only open link lookups. Wire shapes from node-kakao 8512e469 (MIT,
 // storycraft) TalkOpenLinkSession.getJoinInfo `{ lu, ref: 'EW' }` (the link a
@@ -208,9 +212,14 @@ export class LocoSession {
     return sendCreateDirectChatPacket(this.connection, peerId)
   }
 
-  async joinOpenLink(linkId: Long, profile: OpenJoinProfileWire): Promise<LocoPacket> {
+  async joinOpenLink(linkId: Long, profile: OpenJoinProfileWire, token?: string): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
-    return this.connection.sendPacket(JOIN_OPEN_LINK_METHOD, buildJoinOpenLinkBody(linkId, profile))
+    return this.connection.sendPacket(JOIN_OPEN_LINK_METHOD, buildJoinOpenLinkBody(linkId, profile, token))
+  }
+
+  async checkOpenLinkPasscode(linkId: Long, passcode: string): Promise<LocoPacket> {
+    if (!this.connection) throw new Error('Not connected')
+    return this.connection.sendPacket(OPEN_LINK_PASSCODE_METHOD, { li: linkId, pc: passcode })
   }
 
   async getOpenLinkJoinInfo(linkUrl: string): Promise<LocoPacket> {

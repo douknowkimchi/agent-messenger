@@ -51,6 +51,7 @@ import {
   type KakaoOpenJoinProfile,
   type KakaoOpenLink,
   type KakaoOpenLinkJoinInfo,
+  type KakaoOpenLinkPasscodeCheck,
   type KakaoOwnOpenProfile,
   type KakaoOpenSelfProfile,
   type KakaoProfile,
@@ -942,7 +943,7 @@ function validNickname(value: unknown): value is string {
     !/[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(value)
 }
 
-function anyProfileAllowed(value: unknown): boolean | null {
+function privilegeBit(value: unknown, bit: bigint): boolean | null {
   // INFOLINK pv is BSON int64. The packet decoder promotes small values to
   // numbers but keeps large masks as Long; never flatten those to Number.
   if (typeof value !== 'number' && (!value || typeof value !== 'object' || Array.isArray(value))) return null
@@ -950,7 +951,21 @@ function anyProfileAllowed(value: unknown): boolean | null {
   if (normalized === null) return null
   const mask = BigInt(normalized)
   if (mask > MAX_SIGNED_INT64) return null
-  return (mask & 32n) !== 0n
+  return (mask & bit) !== 0n
+}
+
+// LinkPrivilegeMask (KiwiTalk talk-loco-client openlink): ANY_PROFILE_ALLOWED 32, USE_PASSCODE 64.
+const anyProfileAllowed = (value: unknown) => privilegeBit(value, 32n)
+const passcodeRequired = (value: unknown) => privilegeBit(value, 64n)
+
+// A passcode as a person types it: bounded, without control characters.
+function validPasscode(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 64 &&
+    !/[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(value)
+}
+
+function validJoinToken(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 1024 && /^[\x21-\x7e]+$/.test(value)
 }
 
 function formatMember(member: Record<string, unknown>): KakaoMember {
@@ -3012,8 +3027,12 @@ export class KakaoTalkClient {
    * missing acknowledgement throws as outcome-unknown. Neither may be retried
    * automatically. Status 0 does not mean a new room was created.
    */
-  async joinOpenDirectOnce(linkId: string, profile: KakaoOpenJoinProfile): Promise<KakaoJoinOpenDirectResult> {
+  async joinOpenDirectOnce(linkId: string, profile: KakaoOpenJoinProfile,
+    options: { token?: string } = {}): Promise<KakaoJoinOpenDirectResult> {
     const parsedLinkId = parsePositiveSignedInt64(linkId, 'link')
+    if (options.token !== undefined && !validJoinToken(options.token)) {
+      throw new KakaoTalkError('Invalid open join token', 'invalid_open_join_token')
+    }
     let wire: { ptp: 1 } | { ptp: 16; pli: Long } | { ptp: 2; nn: string; pp: string }
     if (profile?.kind === 'main') {
       wire = { ptp: 1 }
@@ -3028,7 +3047,7 @@ export class KakaoTalkClient {
     }
     const session = await this.acquireSession()
     try {
-      const response = await session.joinOpenLink(parsedLinkId, wire)
+      const response = await session.joinOpenLink(parsedLinkId, wire, options.token)
       const header = response.statusCode
       if (!Number.isSafeInteger(header) || isSyntheticConnectionClose(response)) {
         throw new LocoResponseError('JOINLINK outcome unknown: transport acknowledgement missing', 'transient_or_unknown', {
@@ -3108,9 +3127,37 @@ export class KakaoTalkClient {
         description: typeof ol.desc === 'string' && ol.desc.length <= OPEN_LINK_TEXT_MAX ? ol.desc : null,
         owner_nickname: isPlainRecord(ol.olu) && validNickname(ol.olu.nn) ? ol.olu.nn : null,
         member_limit: typeof ol.ml === 'number' && Number.isSafeInteger(ol.ml) && ol.ml > 0 ? ol.ml : null,
+        passcode_required: passcodeRequired(ol.pv),
       }
     } catch (error) {
       throw wrapError(error, 'get_open_link_join_info_failed', { classifyResponseFailure: true })
+    }
+  }
+
+  /**
+   * Check one passcode for a passcode link (CHECKJOIN { li, pc }), once, on
+   * the current ready session: no acquire, reconnect or retry, and nothing is
+   * joined. A non-zero body status is Kakao's refusal, returned with no token;
+   * status 0 must carry a bounded token, which the one JOINLINK then takes.
+   * The passcode is sent as typed and never kept.
+   */
+  async checkOpenLinkPasscodeOnce(linkId: string, passcode: string,
+    options: { signal?: AbortSignal } = {}): Promise<KakaoOpenLinkPasscodeCheck> {
+    const parsedLinkId = parsePositiveSignedInt64(linkId, 'link')
+    if (!validPasscode(passcode)) throw new KakaoTalkError('Invalid open link passcode', 'invalid_open_link_passcode')
+    const { session, check } = this.captureReadySession(options.signal, 'check_open_link_passcode_failed')
+    try {
+      const response = await session.checkOpenLinkPasscode(parsedLinkId, passcode)
+      check()
+      if (response.statusCode === 0 && !isPlainRecord(response.body)) throw new Error('CHECKJOIN response invalid body')
+      const status = isPlainRecord(response.body) ? response.body.status : undefined
+      if (typeof status === 'number' && Number.isSafeInteger(status) && status !== 0) return { status_code: status, token: null }
+      assertLocoOk(response, 'CHECKJOIN')
+      if (status !== 0) throw new Error('CHECKJOIN response status missing')
+      if (!validJoinToken(response.body.tk)) throw new Error('CHECKJOIN response invalid token')
+      return { status_code: 0, token: response.body.tk }
+    } catch (error) {
+      throw wrapError(error, 'check_open_link_passcode_failed', { classifyResponseFailure: true })
     }
   }
 

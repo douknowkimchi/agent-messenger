@@ -93,6 +93,12 @@ export type {
   KakaoOAuthRefreshResult,
 } from './auth/oauth-refresh'
 export { sha1Hex } from './media-upload'
+export {
+  BubbleReactionReadError,
+  type BubbleReactionKind,
+  type BubbleReactionMembers,
+  type BubbleReactionOutcome,
+} from './protocol/bubble-reactions'
 export { detectImageDimensions } from './image-meta'
 export type { AttachmentInput, AttachmentPlan, ResolvedAttachment, SingleAttachmentKind } from './attachment-router'
 export { planAttachments, resolveAttachment } from './attachment-router'

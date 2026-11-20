@@ -206,3 +206,24 @@ Deliberate differences:
   left outcome-unknown: the donor's bridge reports any status reply as a
   refusal, but its research calls a failed WRITEMEDIA reply ambiguous and
   names no status that proves nothing was stored.
+
+## bubble-reactions.ts (internal/protocol/reactions/reactions.go)
+
+- Scope. General kinds 0-6 on direct and normal group chats only: no link id
+  is sent, so open chats and mini reactions are not supported.
+- Headers. The account's existing REST identity (`accountRestHeaders`) with
+  the talk-* additions the media HTTP upload sends to talk-pilsner, not the
+  donor's Mac web profile.
+- Ids. The log id is written into the request as its exact digits and every
+  member id and revision is read from its JSON number token as a decimal
+  string, so ids above 2^53 are exact. A string that looks like a number is
+  not accepted as one.
+- Members. Any general kind that is present but is not an array of positive
+  int64 numbers (null included), a malformed revision or one user in two
+  kinds fails the whole answer; the donor skips such a kind and succeeds.
+  A missing or zero revision is null.
+- Outcome. One request, no redirect, no retry, one deadline for the whole
+  exchange. A non-2xx answer other than 4xx, a redirect or a malformed body
+  is unknown; 4xx and an explicit non-zero status or `result: false` are a
+  refusal whose effect is still unconfirmed.
+

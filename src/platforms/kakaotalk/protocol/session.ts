@@ -80,6 +80,13 @@ export function buildJoinOpenLinkBody(linkId: Long, profile: OpenJoinProfileWire
   return { li: linkId, ref: 'EW:', ...profile }
 }
 
+// Read-only open link lookups. Wire shapes from node-kakao 8512e469 (MIT,
+// storycraft) TalkOpenLinkSession.getJoinInfo `{ lu, ref: 'EW' }` (the link a
+// shared invite URL names) and getLatestLinkList `{ ltk }` (the links this
+// account owns; ltk 0 asks for all of them). Neither joins or changes a link.
+export const OPEN_LINK_JOIN_INFO_METHOD = 'JOININFO'
+export const OPEN_LINK_SYNC_METHOD = 'SYNCLINK'
+
 export class LocoSession {
   private connection: LocoConnection | null = null
   private pingTimer: ReturnType<typeof setInterval> | null = null
@@ -204,6 +211,16 @@ export class LocoSession {
   async joinOpenLink(linkId: Long, profile: OpenJoinProfileWire): Promise<LocoPacket> {
     if (!this.connection) throw new Error('Not connected')
     return this.connection.sendPacket(JOIN_OPEN_LINK_METHOD, buildJoinOpenLinkBody(linkId, profile))
+  }
+
+  async getOpenLinkJoinInfo(linkUrl: string): Promise<LocoPacket> {
+    if (!this.connection) throw new Error('Not connected')
+    return this.connection.sendPacket(OPEN_LINK_JOIN_INFO_METHOD, { lu: linkUrl, ref: 'EW' })
+  }
+
+  async syncOpenLinks(lastLinkToken: number): Promise<LocoPacket> {
+    if (!this.connection) throw new Error('Not connected')
+    return this.connection.sendPacket(OPEN_LINK_SYNC_METHOD, { ltk: lastLinkToken })
   }
 
   // Quoted reply — a WRITE with message_type 26 (REPLY) whose `extra` JSON

@@ -70,6 +70,10 @@ Use the **Release** GitHub Actions workflow (`workflow_dispatch`). It typechecks
 
 `getOpenRoomIdentityOnce` reads an existing open room through the existing CHATINFO/GETMEM/INFOLINK parsers on one captured ready session (at most eight packets). It never acquires, reconnects, JOINs or marks read; every await fences cancellation and replacement. Legacy readers keep their existing behavior.
 
+## Open link invites
+
+`getOpenLinkJoinInfoOnce(url)` sends one JOININFO `{ lu, ref: 'EW' }` for an exact `https://open.kakao.com/o/<code>` URL only, and `listOwnOpenProfilesOnce()` one SYNCLINK `{ ltk: 0 }`, both on the captured ready session (no acquire, reconnect or retry) and fenced against cancellation and replacement. Neither joins. A malformed answer is refused, never filled in; a provider refusal keeps `provider_rejection` and its status. Joining a shared invite reuses `joinOpenDirectOnce` (one JOINLINK, never replayed); passcode links (CHECKJOIN) are not supported. The caller owns the reservation and room verification. Synthetic tests do not establish live provider acceptance.
+
 `getRecentMessagesReadOnlyOnce` is the opt-in room-opening history owner: reuse existing MCHATLOGS parsing on one captured session with four-page maximum; no SYNCMSG/CHATONROOM/NOTIREAD fallback, no acquire/reconnect. An unproved suffix remains unavailable. `getChatOnce` and `getMemberSnapshotOnce` reuse the current snapshot decoders without session acquisition. Legacy history repair consumers are unchanged.
 
 ## Media send result contract

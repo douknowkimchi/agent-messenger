@@ -204,6 +204,32 @@ export interface KakaoOpenLink {
 export type KakaoOpenJoinProfile = { kind: 'main' } | { kind: 'open_profile'; link_id: string }
   | { kind: 'anonymous'; nickname: string; profile_path: string }
 
+/**
+ * The open link a shared invite URL names (JOININFO ol), reduced to what a
+ * preview shows and a join must match. Nothing is joined by reading it.
+ */
+export interface KakaoOpenLinkJoinInfo extends KakaoOpenLink {
+  /** ol.lu as answered (bounded string), or null when absent; the caller compares it. */
+  link_url: string | null
+  /** ol.ln: the room or open profile name. */
+  name: string
+  /** ol.desc when a bounded string; else null. */
+  description: string | null
+  /** ol.olu.nn: the owner's open nickname when a valid one; else null. */
+  owner_nickname: string | null
+  /** ml (open chat member limit) when a positive integer; else null. */
+  member_limit: number | null
+}
+
+/** One open profile this account owns (SYNCLINK, link type 1, active). */
+export interface KakaoOwnOpenProfile {
+  link_id: string
+  /** ol.ln as answered. */
+  name: string
+  /** ol.olu.nn: the nickname this profile shows, when a valid one. */
+  nickname: string | null
+}
+
 export type KakaoJoinOpenDirectResult =
   | {
       success: true

@@ -2970,8 +2970,8 @@ export class KakaoTalkClient {
    * team service with this account's credentials. A chat that is not a Team
    * Chat fails as `not_team`; nothing is written, joined or retried.
    */
-  async getTeamChatInfoOnce(chatId: string): Promise<TeamChatInfo> {
-    return getTeamChatInfoOnce(this.bubbleReactionHttp(), chatId)
+  async getTeamChatInfoOnce(chatId: string, options?: { signal?: AbortSignal }): Promise<TeamChatInfo> {
+    return getTeamChatInfoOnce(this.bubbleReactionHttp(), chatId, options?.signal)
   }
 
   // The account's REST identity, shared by getProfile and the media HTTP upload.

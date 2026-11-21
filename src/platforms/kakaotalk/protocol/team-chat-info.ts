@@ -23,8 +23,12 @@ const NOT_TEAM_CODE = '90001'
 export interface TeamChatInfo {
   chat_id: string
   name: string
-  /** The intro the client calls "About team"; empty when none is set. */
-  description: string
+  /**
+   * The intro the client calls "About team" as the answer gave it ("" when it
+   * gave an empty one). null when the answer carried no description field:
+   * its absence is not established to mean "no intro", so nothing is filled in.
+   */
+  description: string | null
   /** The host's native user id as an exact decimal string. */
   host_id: string
   /** The service's own state, e.g. "ACTIVE"; passed through, never interpreted. */
@@ -32,7 +36,7 @@ export interface TeamChatInfo {
 }
 
 export class TeamChatInfoError extends Error {
-  constructor(readonly reason: 'invalid_request' | 'not_team' | 'transport' | 'rejected' | 'malformed') {
+  constructor(readonly reason: 'invalid_request' | 'not_team' | 'transport' | 'rejected' | 'malformed' | 'cancelled') {
     super(`Team chat info unavailable (${reason})`)
     this.name = 'TeamChatInfoError'
   }
@@ -60,24 +64,38 @@ export function decodeTeamChatInfo(text: string, chatId: string): TeamChatInfo {
   const host =
     typeof value.hostId === 'string' ? (canonicalId(value.hostId) ? value.hostId : null) : exactId(exact.hostId)
   const name = boundedString(value.name, false)
-  const description = value.description === undefined || value.description === null
-    ? ''
-    : boundedString(value.description, true)
+  const described = Object.hasOwn(value, 'description')
+  const description = described ? boundedString(value.description, true) : null
   const status = boundedString(value.status, false)
-  if (host === null || name === null || description === null || status === null) {
+  if (host === null || name === null || (described && description === null) || status === null) {
     throw new TeamChatInfoError('malformed')
   }
   return { chat_id: chatId, name, description, host_id: host, status }
 }
 
-/** Reads one Team Chat's profile once; never retried here. */
-export async function getTeamChatInfoOnce(http: BubbleReactionHttp, chatId: string): Promise<TeamChatInfo> {
+/**
+ * Reads one Team Chat's profile once; never retried here. A caller's `signal`
+ * abandons the request: nothing is sent once it is aborted, and an answer that
+ * arrives after the abort is dropped (`cancelled`).
+ */
+export async function getTeamChatInfoOnce(
+  http: BubbleReactionHttp,
+  chatId: string,
+  signal?: AbortSignal,
+): Promise<TeamChatInfo> {
   if (!canonicalId(chatId)) throw new TeamChatInfoError('invalid_request')
-  const answer = await oneRequest(http, URL, {
-    method: 'POST',
-    headers: { ...http.authorizedHeaders, 'Content-Type': 'application/json' },
-    body: `{"chatId":${chatId}}`,
-  })
+  if (signal?.aborted) throw new TeamChatInfoError('cancelled')
+  const answer = await oneRequest(
+    http,
+    URL,
+    {
+      method: 'POST',
+      headers: { ...http.authorizedHeaders, 'Content-Type': 'application/json' },
+      body: `{"chatId":${chatId}}`,
+    },
+    signal,
+  )
+  if (signal?.aborted) throw new TeamChatInfoError('cancelled')
   if (answer === null) throw new TeamChatInfoError('transport')
   if (answer.status === 404) {
     const value = parseObject(answer.text)

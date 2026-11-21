@@ -54,6 +54,28 @@ describe('getTeamChatInfoOnce', () => {
     expect(slow.calls).toHaveLength(1)
   })
 
+  it('sends nothing for an already cancelled read and drops an answer that arrives after a cancel', async () => {
+    const early = http(() => json(200, team('5')))
+    const done = new AbortController()
+    done.abort()
+    await expect(getTeamChatInfoOnce(early.http, '5', done.signal)).rejects.toMatchObject({ reason: 'cancelled' })
+    expect(early.calls).toHaveLength(0)
+
+    let release: (() => void) | undefined
+    const late = http((_url, init) => {
+      expect(init.signal?.aborted).toBe(false)
+      return new Promise<Response>((resolve) => { release = () => resolve(json(200, team('5'))) })
+    })
+    const cancel = new AbortController()
+    const read = getTeamChatInfoOnce(late.http, '5', cancel.signal)
+    await Promise.resolve()
+    cancel.abort()
+    await expect(read).rejects.toMatchObject({ reason: 'cancelled' })
+    expect(late.calls[0].init.signal?.aborted).toBe(true)
+    release?.()
+    expect(late.calls).toHaveLength(1)
+  })
+
   it('refuses a malformed chat id before any request', async () => {
     for (const id of ['', '0', '-1', '01', '9223372036854775808', '1.5']) {
       const fake = http(() => json(200, team('1')))
@@ -69,9 +91,10 @@ describe('decodeTeamChatInfo', () => {
     expect(decodeTeamChatInfo(team(BIG), BIG).chat_id).toBe(BIG)
   })
 
-  it('accepts a numeric host id by its digits and an absent intro as empty', () => {
+  it('accepts a numeric host id by its digits; an absent intro stays unknown (null), an empty one is ""', () => {
     const text = `{"chatId":7,"name":"n","hostId":${BIG},"status":"ACTIVE"}`
-    expect(decodeTeamChatInfo(text, '7')).toEqual({ chat_id: '7', name: 'n', description: '', host_id: BIG, status: 'ACTIVE' })
+    expect(decodeTeamChatInfo(text, '7')).toEqual({ chat_id: '7', name: 'n', description: null, host_id: BIG, status: 'ACTIVE' })
+    expect(decodeTeamChatInfo('{"chatId":7,"name":"n","description":"","hostId":"1","status":"A"}', '7').description).toBe('')
   })
 
   it('fails the whole answer for any missing, mistyped or oversized field', () => {
@@ -86,6 +109,7 @@ describe('decodeTeamChatInfo', () => {
       '{"chatId":7,"name":"n","hostId":0,"status":"ACTIVE"}',
       '{"chatId":7,"name":"n","hostId":"42"}',
       '{"chatId":7,"name":"n","description":5,"hostId":"42","status":"ACTIVE"}',
+      '{"chatId":7,"name":"n","description":null,"hostId":"42","status":"ACTIVE"}',
       `{"chatId":7,"name":"${'x'.repeat(4097)}","hostId":"42","status":"ACTIVE"}`,
     ]) {
       expect(() => decodeTeamChatInfo(text, '7')).toThrow(TeamChatInfoError)

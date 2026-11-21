@@ -90,16 +90,22 @@ export async function oneRequest(
   http: BubbleReactionHttp,
   url: string,
   init: RequestInit,
+  cancel?: AbortSignal,
 ): Promise<{ status: number; text: string } | null> {
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
-  // The deadline covers the whole exchange, also for a fetch that ignores
-  // its signal: the request is then abandoned, never repeated.
+  let stop: (() => void) | undefined
+  // The deadline, and a caller's cancel, cover the whole exchange, also for a
+  // fetch that ignores its signal: the request is then abandoned (a late
+  // answer is dropped), never repeated.
   const expired = new Promise<null>((resolve) => {
-    timer = setTimeout(() => {
+    stop = () => {
       controller.abort()
       resolve(null)
-    }, http.timeoutMs ?? BUBBLE_REACTION_TIMEOUT_MS)
+    }
+    timer = setTimeout(stop, http.timeoutMs ?? BUBBLE_REACTION_TIMEOUT_MS)
+    if (cancel?.aborted) stop()
+    else cancel?.addEventListener('abort', stop, { once: true })
   })
   const exchange = (async () => {
     const response = await http.fetch(url, { ...init, redirect: 'manual', signal: controller.signal })
@@ -109,6 +115,7 @@ export async function oneRequest(
     return await Promise.race([exchange, expired])
   } finally {
     clearTimeout(timer)
+    if (stop) cancel?.removeEventListener('abort', stop)
   }
 }
 

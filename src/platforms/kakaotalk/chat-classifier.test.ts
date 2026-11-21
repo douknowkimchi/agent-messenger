@@ -31,6 +31,32 @@ describe('classifyKakaoChat', () => {
     expect(classifyKakaoChat({ type: 11, active_members: 1 })).toBe('dm')
   })
 
+  it('classifies a Team Chat as group whatever its member count', () => {
+    for (const active_members of [1, 2, 3, 50]) {
+      expect(classifyKakaoChat({ type: 1, active_members, team: true })).toBe('group')
+      expect(classifyKakaoChat({ type: 'MultiChat', active_members, team: true })).toBe('group')
+    }
+  })
+
+  it('lets the team flag override neither an open chat nor an unknown string type', () => {
+    expect(classifyKakaoChat({ type: 'OM', active_members: 2, team: true })).toBe('open')
+    expect(classifyKakaoChat({ type: 13, active_members: 2, team: true })).toBe('open')
+    expect(classifyKakaoChat({ type: 'UnknownChat', active_members: 2, team: true })).toBe('unknown')
+  })
+
+  it('keeps member-count classification when the team-state is false or unknown', () => {
+    expect(classifyKakaoChat({ type: 1, active_members: 2, team: false })).toBe('dm')
+    expect(classifyKakaoChat({ type: 1, active_members: 3, team: false })).toBe('group')
+    expect(classifyKakaoChat({ type: 1, active_members: 2 })).toBe('dm')
+  })
+
+  for (const type of ['DirectChat', 'MemoChat', 'PlusChat'] as const) {
+    it(`keeps an explicitly named ${type} on member count even with a team meta`, () => {
+      expect(classifyKakaoChat({ type, active_members: 2, team: true })).toBe('dm')
+      expect(classifyKakaoChat({ type, active_members: 3, team: true })).toBe('group')
+    })
+  }
+
   for (const type of ['DirectChat', 'MultiChat', 'PlusChat', 'MemoChat'] as const) {
     it(`keeps member-count classification for known normal type ${type}`, () => {
       expect(classifyKakaoChat({ type, active_members: 2 })).toBe('dm')

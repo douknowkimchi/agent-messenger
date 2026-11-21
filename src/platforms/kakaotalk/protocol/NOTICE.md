@@ -59,6 +59,18 @@ behavior only; no source code was copied or adapted.
 
 ---
 
+## kakaobridge
+
+- Repository: https://github.com/libhwang50/kakaobridge
+- Reference commit: b499c3ab7cc0db0aadd01c1aad0eeb6988035bf7
+- License: AGPL-3.0-or-later
+- Note: Referenced for protocol behavior only; no code copied or adapted.
+
+Referenced for: `docs/protocol-notes.md` §7a, the CHATINFO `chatMetas` entry of
+type 15 whose presence tells a Team Chat from a Regular Chat of the same chat type.
+
+---
+
 ## Original LOCO Protocol Research
 
 - Author: Cai (bpak.org)

@@ -108,6 +108,13 @@ export interface KakaoChat {
   unread_count: number
   /** The open chat's own link id (room li), canonical positive int64; null for normal chats or when absent. Never a member's profile link. */
   link_id?: string | null
+  /**
+   * Team-state of a normal chat from this read's CHATINFO: true when it carried the
+   * team-state meta (type 15, a Team Chat), false when an accepted answer listed metas
+   * without it. Absent when CHATINFO was not read or not readable, and for open chats:
+   * unknown, never "not a team".
+   */
+  team?: boolean
   last_message: {
     author_id: number
     author_name: string | null

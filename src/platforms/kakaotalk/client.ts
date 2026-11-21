@@ -26,6 +26,7 @@ import {
   getBubbleReactionMembers,
   setBubbleReactionOnce,
 } from './protocol/bubble-reactions'
+import { getTeamChatInfoOnce, type TeamChatInfo } from './protocol/team-chat-info'
 import { LANG, PC_OS_NAME, getLocoDeviceConfig } from './protocol/config'
 import { isSyntheticConnectionClose } from './protocol/login-response'
 import { directHeaders } from './protocol/media-direct'
@@ -2962,6 +2963,15 @@ export class KakaoTalkClient {
   /** The current general reaction members of one message, read once. */
   async getBubbleReactionMembers(chatId: string, logId: string): Promise<BubbleReactionMembers> {
     return getBubbleReactionMembers(this.bubbleReactionHttp(), chatId, logId)
+  }
+
+  /**
+   * One Team Chat's own profile (name, intro, host, state), read once from the
+   * team service with this account's credentials. A chat that is not a Team
+   * Chat fails as `not_team`; nothing is written, joined or retried.
+   */
+  async getTeamChatInfoOnce(chatId: string, options?: { signal?: AbortSignal }): Promise<TeamChatInfo> {
+    return getTeamChatInfoOnce(this.bubbleReactionHttp(), chatId, options?.signal)
   }
 
   // The account's REST identity, shared by getProfile and the media HTTP upload.

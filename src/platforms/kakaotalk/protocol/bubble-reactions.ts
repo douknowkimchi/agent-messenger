@@ -86,20 +86,26 @@ function isKind(value: unknown): value is BubbleReactionKind {
   return Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 6
 }
 
-async function oneRequest(
+export async function oneRequest(
   http: BubbleReactionHttp,
   url: string,
   init: RequestInit,
+  cancel?: AbortSignal,
 ): Promise<{ status: number; text: string } | null> {
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
-  // The deadline covers the whole exchange, also for a fetch that ignores
-  // its signal: the request is then abandoned, never repeated.
+  let stop: (() => void) | undefined
+  // The deadline, and a caller's cancel, cover the whole exchange, also for a
+  // fetch that ignores its signal: the request is then abandoned (a late
+  // answer is dropped), never repeated.
   const expired = new Promise<null>((resolve) => {
-    timer = setTimeout(() => {
+    stop = () => {
       controller.abort()
       resolve(null)
-    }, http.timeoutMs ?? BUBBLE_REACTION_TIMEOUT_MS)
+    }
+    timer = setTimeout(stop, http.timeoutMs ?? BUBBLE_REACTION_TIMEOUT_MS)
+    if (cancel?.aborted) stop()
+    else cancel?.addEventListener('abort', stop, { once: true })
   })
   const exchange = (async () => {
     const response = await http.fetch(url, { ...init, redirect: 'manual', signal: controller.signal })
@@ -109,6 +115,7 @@ async function oneRequest(
     return await Promise.race([exchange, expired])
   } finally {
     clearTimeout(timer)
+    if (stop) cancel?.removeEventListener('abort', stop)
   }
 }
 
@@ -157,7 +164,7 @@ export async function setBubbleReactionOnce(
 // Every JSON number of a valid document rewritten as the string "#<digits>",
 // so that ids above 2^53 survive JSON.parse, and every string value replaced
 // by "!", so that no original string can pass for a number. Keys are kept.
-function numbersAsText(text: string): string {
+export function numbersAsText(text: string): string {
   let out = ''
   for (let at = 0; at < text.length; ) {
     const char = text[at]
@@ -180,7 +187,7 @@ function numbersAsText(text: string): string {
   return out
 }
 
-function exactId(value: unknown): string | null {
+export function exactId(value: unknown): string | null {
   if (typeof value !== 'string' || !value.startsWith('#')) return null
   const digits = value.slice(1)
   return canonicalId(digits) ? digits : null

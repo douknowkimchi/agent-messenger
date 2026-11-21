@@ -508,7 +508,7 @@ function displayMemberIds(value: unknown): string[] | null {
   return ids
 }
 
-function formatChat(chat: ChatData, title: string | null, nameCache: MemberNameCache): KakaoChat {
+function formatChat(chat: ChatData, title: string | null, nameCache: MemberNameCache, team?: boolean): KakaoChat {
   const memberNames = (chat.k ?? []) as string[]
   const lastLog = chat.l as Record<string, unknown> | null
   const displayName = memberNames.join(', ') || null
@@ -534,10 +534,17 @@ function formatChat(chat: ChatData, title: string | null, nameCache: MemberNameC
     // The open chat's own link (login list / CHATINFO `li`), strictly read;
     // an open chat only, so a normal chat's answer keeps its v1 shape.
     ...(isOpenKakaoChatType(type) ? { link_id: positiveSignedInt64String(chat.li) } : {}),
+    // Team-state as this read's CHATINFO showed it for a normal chat: true or
+    // false when accepted, absent when not read or not readable (a caller keeps
+    // what it knew rather than reading a failure as "not a team").
+    ...(team !== undefined && !isOpenKakaoChatType(type) ? { team } : {}),
   }
 }
 
 const META_TYPE_TITLE = 3
+// Team-state meta: its presence on a normal group chat's CHATINFO is what makes
+// it a Team Chat (a Regular Chat and a Team Chat share the same chat type).
+const META_TYPE_TEAM = 15
 
 interface ChannelMetaEntry {
   type?: number
@@ -573,6 +580,25 @@ function extractTitle(body: Record<string, unknown>): string | null {
   const titleMeta = metas.find((m) => m?.type === META_TYPE_TITLE)
   const content = titleMeta?.content
   return typeof content === 'string' && content.length > 0 ? content : null
+}
+
+/**
+ * Team-state of one CHATINFO answer about the asked chat: true when its
+ * `chatMetas` holds an entry of exactly type 15, false when an accepted answer
+ * lists metas without one. undefined (unknown) for a failed status, another
+ * chat, a left chat or no meta list, so a failure is never read as "not a team".
+ */
+function readTeamMeta(response: LocoPacket, expectedChatId: string): boolean | undefined {
+  try {
+    assertLocoOk(response, 'CHATINFO')
+    const info = extractChannelInfo(response.body as Record<string, unknown>, expectedChatId)
+    if (info.left !== undefined && info.left !== false) return undefined
+    const metas = info.chatMetas
+    if (!Array.isArray(metas)) return undefined
+    return metas.some((m) => m !== null && typeof m === 'object' && m.type === META_TYPE_TEAM)
+  } catch {
+    return undefined
+  }
 }
 
 function extractChannelInfo(body: Record<string, unknown>, expectedChatId: string): ChannelInfoData {
@@ -1635,13 +1661,15 @@ export class KakaoTalkClient {
           results = allChats.filter((c) => matchesSearch(c, options.search!))
         }
 
-        const titles = options?.resolveTitles
+        const headers = options?.resolveTitles
           ? await Promise.all(
-              results.map((chat) => this.fetchChatTitle(session, parseLong(longToString(chat.c)), chat)),
+              results.map((chat) => this.fetchChatHeader(session, parseLong(longToString(chat.c)), chat)),
             )
           : null
 
-        return results.map((chat, i) => formatChat(chat, titles ? titles[i] : null, this.nameCache))
+        return results.map((chat, i) =>
+          formatChat(chat, headers ? headers[i].title : null, this.nameCache, headers?.[i].team),
+        )
       } catch (error) {
         throw wrapError(error, 'get_chats_failed')
       }
@@ -1805,6 +1833,7 @@ export class KakaoTalkClient {
       }
       const chat = channelInfoToChatData(body, normalizedChatId)
       this.nameCache.ingest([chat])
+      const team = readTeamMeta(response, normalizedChatId)
 
       let title = extractTitle(body)
       if (!title && isOpenChat(chat)) {
@@ -1821,7 +1850,7 @@ export class KakaoTalkClient {
         }
       }
 
-      return formatChat(chat, title, this.nameCache)
+      return formatChat(chat, title, this.nameCache, team)
     } catch (error) {
       throw wrapError(error, 'get_chat_failed', {
         classifyResponseFailure: true,
@@ -1844,30 +1873,38 @@ export class KakaoTalkClient {
     }
     return this.executeWithReconnect(async ({ session, loginResult }) => {
       const chat = (loginResult.chatDatas ?? []).find((c) => String(c.c) === chatId)
-      return this.fetchChatTitle(session, parsed, chat)
+      return (await this.fetchChatHeader(session, parsed, chat)).title
     })
   }
 
-  private async fetchChatTitle(session: LocoSession, chatId: Long, chat: ChatData | undefined): Promise<string | null> {
+  /** The room title and the team-state read from one CHATINFO; a failed read leaves the team unknown. */
+  private async fetchChatHeader(
+    session: LocoSession,
+    chatId: Long,
+    chat: ChatData | undefined,
+  ): Promise<{ title: string | null; team: boolean | undefined }> {
     let title: string | null = null
+    let team: boolean | undefined
     try {
       const response = await session.getChannelInfo(chatId)
       title = extractTitle(response.body as Record<string, unknown>)
+      team = readTeamMeta(response, longToString(chatId))
     } catch {
       title = null
+      team = undefined
     }
 
-    if (title) return title
-    if (!chat || !isOpenChat(chat)) return null
+    if (title) return { title, team }
+    if (!chat || !isOpenChat(chat)) return { title: null, team }
 
     const linkId = getOpenLinkId(chat)
-    if (!linkId) return null
+    if (!linkId) return { title: null, team }
 
     try {
       const response = await session.getOpenLinkInfo([linkId])
-      return extractOpenLinkName(response.body as Record<string, unknown>)
+      return { title: extractOpenLinkName(response.body as Record<string, unknown>), team }
     } catch {
-      return null
+      return { title: null, team }
     }
   }
 

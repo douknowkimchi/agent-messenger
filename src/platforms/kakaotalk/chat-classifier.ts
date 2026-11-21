@@ -25,11 +25,14 @@ export function isOpenKakaoChatType(type: unknown): type is KakaoOpenChatType {
  * closed instead of silently classifying an unrecognized server value by
  * member count.
  */
-export function classifyKakaoChat(chat: Pick<KakaoChat, 'type' | 'active_members'>): KakaoChatKind {
+export function classifyKakaoChat(chat: Pick<KakaoChat, 'type' | 'active_members' | 'team'>): KakaoChatKind {
   if (isOpenKakaoChatType(chat.type)) return 'open'
   if (typeof chat.type === 'string' && !isKnownKakaoChatStringType(chat.type)) {
     return 'unknown'
   }
+  // A Team Chat is a group whatever its size: a two-person team is not the
+  // 1:1 with the other member. Only the SDK's own CHATINFO read sets `team`.
+  if (chat.team === true) return 'group'
   // active_members counts the logged-in user, so a 1:1 DM is exactly 2
   // (self + one other) and a "lone" room with only self is 1.
   if (chat.active_members <= 2) return 'dm'

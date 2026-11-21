@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, mock, it } from 'bun:test'
 import { Long } from 'bson'
 
 import { KakaoTalkClient, KakaoTalkError } from './client'
+import { classifyKakaoChat } from './chat-classifier'
 
 // Mock LocoSession at module level
 const mockLogin = mock(() => Promise.resolve({}))
@@ -535,6 +536,77 @@ describe('KakaoTalkClient', () => {
       const [linkIds] = mockGetOpenLinkInfo.mock.calls[0] as [Array<{ low: number; high: number }>]
       expect(linkIds).toHaveLength(1)
       expect(linkIds[0]).toMatchObject({ low: 8888, high: 0 })
+
+      client.close()
+    })
+
+    it('reads team-state from each resolveTitles CHATINFO and leaves it unknown when the read fails', async () => {
+      const row = (c: number, t: number | string, a: number, extra: Record<string, unknown> = {}) => ({
+        c, t, k: ['Peer'], i: [20], a, n: 0, o: 1700000000 + c, l: null, ll: makeLong(1), ...extra,
+      })
+      mockLogin.mockResolvedValue({
+        chatDatas: [
+          row(700, 1, 2), // team, two people
+          row(701, 1, 2), // regular two-person chat
+          row(702, 1, 2), // type 15 but CHATINFO names another chat
+          row(703, 1, 2), // type '15' as a string
+          row(704, 1, 2), // type 15 on a refused CHATINFO
+          row(705, 'OM', 2, { li: makeLong(9999) }), // open chat with a type-15 entry
+          row(706, 1, 2), // CHATINFO read fails
+          row(707, 1, 2), // type 15 on a chat this account left
+        ],
+        lastTokenId: makeLong(0),
+        lastChatId: makeLong(0),
+        eof: true,
+      })
+      const info = (chatId: number, metas: unknown[], statusCode = 0, extra: Record<string, unknown> = {}) =>
+        Promise.resolve({ statusCode, body: { status: statusCode, chatInfo: { chatId: makeLong(chatId), chatMetas: metas, ...extra } } })
+      const teamMeta = { type: 15, content: '{"warehouse":true}' }
+      mockGetChannelInfo.mockImplementation((chatId: { low: number; high: number }) => {
+        switch (chatId.low) {
+          case 700:
+            return info(700, [{ type: 3, content: 'Team room' }, teamMeta])
+          case 701:
+            return info(701, [{ type: 3, content: 'Pair room' }])
+          case 702:
+            return info(799, [teamMeta])
+          case 703:
+            return info(703, [{ type: '15', content: '{}' }])
+          case 704:
+            return info(704, [teamMeta], -500)
+          case 705:
+            return info(705, [{ type: 3, content: 'Open room' }, teamMeta])
+          case 706:
+            return Promise.reject(new Error('read failed'))
+          case 707:
+            return info(707, [teamMeta], 0, { left: true })
+          default:
+            return Promise.resolve({ body: {} })
+        }
+      })
+
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
+      const chats = await client.getChats({ resolveTitles: true })
+      const byId = Object.fromEntries(chats.map((c) => [c.chat_id, c]))
+
+      expect(byId['700'].team).toBe(true)
+      expect(byId['700'].title).toBe('Team room')
+      expect(classifyKakaoChat(byId['700'])).toBe('group')
+      // Accepted answers whose metas hold no number-15 entry: confirmed not a team.
+      expect(byId['701'].team).toBe(false)
+      expect(byId['703'].team).toBe(false)
+      // Another chat, a refused or failed read, a left chat, an open chat: unknown.
+      for (const id of ['702', '704', '705', '706', '707']) {
+        expect('team' in byId[id]).toBe(false)
+      }
+      expect(classifyKakaoChat(byId['701'])).toBe('dm')
+      expect(classifyKakaoChat(byId['706'])).toBe('dm')
+      expect(classifyKakaoChat(byId['705'])).toBe('open')
+      // Without resolveTitles no CHATINFO is read, so no chat is named a team.
+      mockGetChannelInfo.mockClear()
+      const unresolved = await client.getChats()
+      expect(mockGetChannelInfo).not.toHaveBeenCalled()
+      expect(unresolved.some((c) => 'team' in c)).toBe(false)
 
       client.close()
     })
@@ -1174,6 +1246,41 @@ describe('KakaoTalkClient', () => {
   })
 
   describe('getChat', () => {
+    it('names a two-person chat with a type-15 meta a Team Chat (group) and one without it not a team', async () => {
+      const chatInfo = (metas: unknown[]) => ({
+        statusCode: 0,
+        body: {
+          chatInfo: {
+            chatId: makeLong(310),
+            type: 1,
+            left: false,
+            activeMembersCount: 2,
+            newMessageCount: 0,
+            invalidNewMessageCount: false,
+            lastLogId: makeLong(5),
+            lastSeenLogId: makeLong(5),
+            lastChatLog: null,
+            displayMembers: [{ userId: makeLong(43), nickName: 'Bob' }],
+            chatMetas: metas,
+          },
+        },
+      })
+      mockGetChannelInfo
+        .mockResolvedValueOnce(chatInfo([{ type: 3, content: 'Team room' }, { type: 15, content: '{"warehouse":true}' }]))
+        .mockResolvedValueOnce(chatInfo([{ type: 3, content: 'Team room' }]))
+
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
+      const team = await client.getChat('310')
+      expect(team.team).toBe(true)
+      expect(team.title).toBe('Team room')
+      expect(classifyKakaoChat(team)).toBe('group')
+
+      const regular = await client.getChat('310')
+      expect(regular.team).toBe(false)
+      expect(classifyKakaoChat(regular)).toBe('dm')
+      client.close()
+    })
+
     it('returns one fully normalized late chat from read-only CHATINFO', async () => {
       mockGetChannelInfo.mockResolvedValueOnce({
         statusCode: 0,
@@ -1215,6 +1322,7 @@ describe('KakaoTalkClient', () => {
         title: 'Late room',
         active_members: 2,
         unread_count: 4,
+        team: false,
         last_message: {
           author_id: 42,
           author_name: 'Alice',
@@ -1682,6 +1790,7 @@ describe('KakaoTalkClient', () => {
           title: null,
           active_members: 2,
           unread_count: 0,
+          team: false,
           last_message: null,
         })
         expect(mockGetOpenLinkInfo).not.toHaveBeenCalled()
@@ -1758,6 +1867,7 @@ describe('KakaoTalkClient', () => {
         title: null,
         active_members: 2,
         unread_count: 0,
+        team: false,
         last_message: null,
       })
       expect(mockGetOpenLinkInfo).not.toHaveBeenCalled()

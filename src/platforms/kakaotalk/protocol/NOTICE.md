@@ -67,7 +67,9 @@ behavior only; no source code was copied or adapted.
 - Note: Referenced for protocol behavior only; no code copied or adapted.
 
 Referenced for: `docs/protocol-notes.md` §7a, the CHATINFO `chatMetas` entry of
-type 15 whose presence tells a Team Chat from a Regular Chat of the same chat type.
+type 15 whose presence tells a Team Chat from a Regular Chat of the same chat type,
+and the team service read `POST /alcatraz/v1/chat/info {"chatId"}` with its answer
+fields and the 404 code 90001 of a chat that is not a Team Chat.
 
 ---
 

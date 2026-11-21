@@ -99,6 +99,7 @@ export {
   type BubbleReactionMembers,
   type BubbleReactionOutcome,
 } from './protocol/bubble-reactions'
+export { TeamChatInfoError, type TeamChatInfo } from './protocol/team-chat-info'
 export { detectImageDimensions } from './image-meta'
 export type { AttachmentInput, AttachmentPlan, ResolvedAttachment, SingleAttachmentKind } from './attachment-router'
 export { planAttachments, resolveAttachment } from './attachment-router'

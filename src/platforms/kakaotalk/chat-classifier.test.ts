@@ -50,6 +50,13 @@ describe('classifyKakaoChat', () => {
     expect(classifyKakaoChat({ type: 1, active_members: 2 })).toBe('dm')
   })
 
+  for (const type of ['DirectChat', 'MemoChat', 'PlusChat'] as const) {
+    it(`keeps an explicitly named ${type} on member count even with a team meta`, () => {
+      expect(classifyKakaoChat({ type, active_members: 2, team: true })).toBe('dm')
+      expect(classifyKakaoChat({ type, active_members: 3, team: true })).toBe('group')
+    })
+  }
+
   for (const type of ['DirectChat', 'MultiChat', 'PlusChat', 'MemoChat'] as const) {
     it(`keeps member-count classification for known normal type ${type}`, () => {
       expect(classifyKakaoChat({ type, active_members: 2 })).toBe('dm')

@@ -554,6 +554,8 @@ describe('KakaoTalkClient', () => {
           row(705, 'OM', 2, { li: makeLong(9999) }), // open chat with a type-15 entry
           row(706, 1, 2), // CHATINFO read fails
           row(707, 1, 2), // type 15 on a chat this account left
+          row(708, 1, 2), // a malformed entry and no valid 15
+          row(709, 1, 2), // a malformed entry beside a valid 15
         ],
         lastTokenId: makeLong(0),
         lastChatId: makeLong(0),
@@ -580,6 +582,10 @@ describe('KakaoTalkClient', () => {
             return Promise.reject(new Error('read failed'))
           case 707:
             return info(707, [teamMeta], 0, { left: true })
+          case 708:
+            return info(708, [{ type: 3, content: 'x' }, null])
+          case 709:
+            return info(709, ['garbled', teamMeta])
           default:
             return Promise.resolve({ body: {} })
         }
@@ -592,11 +598,12 @@ describe('KakaoTalkClient', () => {
       expect(byId['700'].team).toBe(true)
       expect(byId['700'].title).toBe('Team room')
       expect(classifyKakaoChat(byId['700'])).toBe('group')
-      // Accepted answers whose metas hold no number-15 entry: confirmed not a team.
+      expect(byId['709'].team).toBe(true)
+      // Accepted answers whose well-formed metas hold no 15: confirmed not a team.
       expect(byId['701'].team).toBe(false)
-      expect(byId['703'].team).toBe(false)
-      // Another chat, a refused or failed read, a left chat, an open chat: unknown.
-      for (const id of ['702', '704', '705', '706', '707']) {
+      // Another chat, a string '15', a refused or failed read, an open chat, a left
+      // chat, a malformed entry without a valid 15: unknown, never "not a team".
+      for (const id of ['702', '703', '704', '705', '706', '707', '708']) {
         expect('team' in byId[id]).toBe(false)
       }
       expect(classifyKakaoChat(byId['701'])).toBe('dm')

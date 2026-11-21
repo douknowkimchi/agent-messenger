@@ -584,9 +584,11 @@ function extractTitle(body: Record<string, unknown>): string | null {
 
 /**
  * Team-state of one CHATINFO answer about the asked chat: true when its
- * `chatMetas` holds an entry of exactly type 15, false when an accepted answer
- * lists metas without one. undefined (unknown) for a failed status, another
- * chat, a left chat or no meta list, so a failure is never read as "not a team".
+ * `chatMetas` holds an object entry whose type is the number 15; false only when
+ * an accepted answer lists well-formed entries (objects with a number type) and
+ * none is 15. undefined (unknown) for a failed status, another chat, a left
+ * chat, no meta list, or a malformed entry without a valid 15, so neither a
+ * failure nor a garbled list is read as "not a team".
  */
 function readTeamMeta(response: LocoPacket, expectedChatId: string): boolean | undefined {
   try {
@@ -595,7 +597,10 @@ function readTeamMeta(response: LocoPacket, expectedChatId: string): boolean | u
     if (info.left !== undefined && info.left !== false) return undefined
     const metas = info.chatMetas
     if (!Array.isArray(metas)) return undefined
-    return metas.some((m) => m !== null && typeof m === 'object' && m.type === META_TYPE_TEAM)
+    const wellFormed = (m: unknown): m is ChannelMetaEntry =>
+      m !== null && typeof m === 'object' && !Array.isArray(m) && Number.isInteger((m as ChannelMetaEntry).type)
+    if (metas.some((m) => wellFormed(m) && m.type === META_TYPE_TEAM)) return true
+    return metas.every(wellFormed) ? false : undefined
   } catch {
     return undefined
   }

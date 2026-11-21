@@ -556,6 +556,11 @@ describe('KakaoTalkClient', () => {
           row(707, 1, 2), // type 15 on a chat this account left
           row(708, 1, 2), // a malformed entry and no valid 15
           row(709, 1, 2), // a malformed entry beside a valid 15
+          row(710, 10, 2), // numeric row; CHATINFO names it DirectChat with a 15
+          row(711, 10, 2), // numeric row; CHATINFO names it an open chat with a 15
+          row(712, 1, 2), // body status is the string "-500"
+          row(713, 1, 2), // CHATINFO chatId whose low word is out of range
+          row(714, 1, 2), // body status is a number other than 0
         ],
         lastTokenId: makeLong(0),
         lastChatId: makeLong(0),
@@ -586,6 +591,16 @@ describe('KakaoTalkClient', () => {
             return info(708, [{ type: 3, content: 'x' }, null])
           case 709:
             return info(709, ['garbled', teamMeta])
+          case 710:
+            return info(710, [teamMeta], 0, { type: 'DirectChat' })
+          case 711:
+            return info(711, [teamMeta], 0, { type: 'OM' })
+          case 712:
+            return Promise.resolve({ statusCode: 0, body: { status: '-500', chatInfo: { chatId: makeLong(712), chatMetas: [] } } })
+          case 713:
+            return Promise.resolve({ statusCode: 0, body: { chatInfo: { chatId: { low: 713 + 4294967296, high: 0 }, chatMetas: [] } } })
+          case 714:
+            return Promise.resolve({ statusCode: 0, body: { status: 7, chatInfo: { chatId: makeLong(714), chatMetas: [] } } })
           default:
             return Promise.resolve({ body: {} })
         }
@@ -599,11 +614,15 @@ describe('KakaoTalkClient', () => {
       expect(byId['700'].title).toBe('Team room')
       expect(classifyKakaoChat(byId['700'])).toBe('group')
       expect(byId['709'].team).toBe(true)
+      // The answer's own explicit 1:1 identity wins over a team meta.
+      expect(byId['710'].team).toBe(false)
+      expect(classifyKakaoChat(byId['710'])).toBe('dm')
       // Accepted answers whose well-formed metas hold no 15: confirmed not a team.
       expect(byId['701'].team).toBe(false)
       // Another chat, a string '15', a refused or failed read, an open chat, a left
       // chat, a malformed entry without a valid 15: unknown, never "not a team".
-      for (const id of ['702', '703', '704', '705', '706', '707', '708']) {
+      // An open CHATINFO type, a non-zero or string body status and an inexact chatId too.
+      for (const id of ['702', '703', '704', '705', '706', '707', '708', '711', '712', '713', '714']) {
         expect('team' in byId[id]).toBe(false)
       }
       expect(classifyKakaoChat(byId['701'])).toBe('dm')

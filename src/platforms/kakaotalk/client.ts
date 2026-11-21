@@ -8,7 +8,7 @@ import { getConfigDir } from '@/shared/utils/config-dir'
 import { warn } from '@/shared/utils/stderr'
 
 import { type AttachmentInput, type ResolvedAttachment, planAttachments } from './attachment-router'
-import { isOpenKakaoChatType } from './chat-classifier'
+import { isExplicitNonGroupKakaoChatType, isOpenKakaoChatType } from './chat-classifier'
 import { detectImageDimensions } from './image-meta'
 import {
   type MediaIo,
@@ -583,18 +583,26 @@ function extractTitle(body: Record<string, unknown>): string | null {
 }
 
 /**
- * Team-state of one CHATINFO answer about the asked chat: true when its
- * `chatMetas` holds an object entry whose type is the number 15; false only when
- * an accepted answer lists well-formed entries (objects with a number type) and
- * none is 15. undefined (unknown) for a failed status, another chat, a left
- * chat, no meta list, or a malformed entry without a valid 15, so neither a
- * failure nor a garbled list is read as "not a team".
+ * Team-state of one CHATINFO answer about the asked chat. It is decided only on
+ * an answer whose packet status is 0, whose body status is absent or the number
+ * 0 and whose chatId is exactly the asked chat; anything else is undefined
+ * (unknown), never "not a team". The answer's own room type wins: an open chat
+ * has no team-state (undefined) and an explicitly named DirectChat, MemoChat or
+ * PlusChat is not a Team Chat (false). Otherwise true when `chatMetas` holds an
+ * object entry whose type is the number 15; false only when every entry is
+ * well formed (an object with an integer type) and none is 15; undefined for a
+ * left chat, no meta list, or a malformed entry without a valid 15.
  */
 function readTeamMeta(response: LocoPacket, expectedChatId: string): boolean | undefined {
   try {
     assertLocoOk(response, 'CHATINFO')
-    const info = extractChannelInfo(response.body as Record<string, unknown>, expectedChatId)
+    const bodyStatus = (response.body as Record<string, unknown>).status
+    if (bodyStatus !== undefined && bodyStatus !== 0) return undefined
+    const info = (response.body as ChannelInfoResponse).chatInfo
+    if (!info || typeof info !== 'object' || readStateId(info.chatId) !== expectedChatId) return undefined
     if (info.left !== undefined && info.left !== false) return undefined
+    if (isOpenKakaoChatType(info.type)) return undefined
+    if (isExplicitNonGroupKakaoChatType(info.type)) return false
     const metas = info.chatMetas
     if (!Array.isArray(metas)) return undefined
     const wellFormed = (m: unknown): m is ChannelMetaEntry =>

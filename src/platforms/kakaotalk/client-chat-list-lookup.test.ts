@@ -6,14 +6,17 @@ import { test } from 'node:test'
 import { Long } from 'bson'
 
 import { KakaoTalkClient } from './client'
+import { decodePacket, encodePacket } from './protocol/packet'
 import type { LocoPacket } from './protocol/types'
 import { LocoSession } from './protocol/session'
 
 const ROOM = '9007199254740993'
 const OTHER = '9007199254740995'
 
+// Replies pass through the production packet codec, as a live session's do:
+// its decoder promotes a small int64 (such as a page position) to a number.
 function packet(body: Record<string, unknown> = {}, statusCode = 0): LocoPacket {
-  return { packetId: 1, statusCode, method: '', bodyType: 0, body }
+  return decodePacket(encodePacket({ packetId: 1, statusCode, method: 'X', bodyType: 0, body }))!.packet
 }
 
 function row(chatId: string, extra: Record<string, unknown> = {}) {
@@ -93,6 +96,32 @@ test('finds a chat on a later page from the list start and reads its header once
   }
 })
 
+test('the next page position survives the decoder in number form and a stuck or missing one fails', async () => {
+  const decoded = packet({ chatDatas: [row(OTHER)], eof: false, lastTokenId: Long.fromInt(7), lastChatId: Long.fromString(OTHER) })
+  assert.equal(typeof decoded.body.lastTokenId, 'number')
+  const found = fixture([decoded, packet({ chatDatas: [row(ROOM)], eof: true })])
+  try {
+    assert.equal((await found.client.findChatInListOnce(ROOM))?.chat_id, ROOM)
+    assert.equal((found.calls[1].body.lastTokenId as Long).toString(), '7')
+  } finally {
+    found.client.close()
+  }
+  const same = () => packet({ chatDatas: [row(OTHER)], eof: false, lastTokenId: Long.fromInt(7), lastChatId: Long.fromInt(9) })
+  for (const [name, pages, sent] of [
+    ['missing position', [packet({ chatDatas: [row(OTHER)], eof: false })], 1],
+    ['negative position', [packet({ chatDatas: [row(OTHER)], eof: false, lastTokenId: -1, lastChatId: 9 })], 1],
+    ['repeated position', [same, same], 2],
+  ] as const) {
+    const f = fixture([...pages])
+    try {
+      await assert.rejects(f.client.findChatInListOnce(ROOM), { code: 'find_chat_in_list_failed' }, name)
+      assert.equal(f.calls.length, sent, name)
+    } finally {
+      f.client.close()
+    }
+  }
+})
+
 test('resolves null when the whole list to EOF does not hold the chat, without CHATINFO', async () => {
   const f = fixture([packet({ chatDatas: [row(OTHER)], eof: true })])
   try {
@@ -147,8 +176,8 @@ for (const [name, page] of [
 }
 
 test('a list longer than the page bound fails instead of reporting absence', async () => {
-  const page = () => packet({ chatDatas: [row(OTHER)], eof: false, lastTokenId: Long.ONE, lastChatId: Long.fromString(OTHER) })
-  const f = fixture(Array.from({ length: 50 }, () => page))
+  const page = (n: number) => () => packet({ chatDatas: [row(OTHER)], eof: false, lastTokenId: Long.fromInt(n + 1), lastChatId: Long.fromString(OTHER) })
+  const f = fixture(Array.from({ length: 50 }, (_, n) => page(n)))
   try {
     await assert.rejects(f.client.findChatInListOnce(ROOM), { code: 'find_chat_in_list_failed' })
     assert.equal(f.calls.length, 50)

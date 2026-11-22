@@ -1823,8 +1823,9 @@ export class KakaoTalkClient {
    * the found chat's header. A room this account was member-invited into after
    * login is refused by CHATINFO on the same session, while a new login lists
    * it; this read lets a caller ask the list. Read-only. chatId must be a
-   * canonical positive uint64. Resolves null when the whole list (to EOF) does
-   * not hold the chat; a refused header read leaves title null and team absent.
+   * canonical positive uint64. Resolves null when this read of the list, to
+   * EOF, did not show the chat: that is no evidence the account is not in it.
+   * A refused header read leaves title null and team absent.
    */
   async findChatInListOnce(chatId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoChat | null> {
     const cid = parseReadStateInput(chatId, 'chat'), wanted = longToString(cid), state = this.state, session = state?.session
@@ -1838,6 +1839,7 @@ export class KakaoTalkClient {
     try {
       let lastTokenId: Long | undefined
       let lastChatId: Long | undefined
+      let lastCursor: string | null = null
       for (let pages = 0; pages < MAX_PAGES; pages++) {
         const response = await session!.getChatList(lastTokenId, lastChatId)
         check()
@@ -1858,8 +1860,17 @@ export class KakaoTalkClient {
         if (chatDatas.length === 0) {
           throw new KakaoTalkError('LCHATLIST pagination incomplete: empty non-EOF page', 'find_chat_in_list_failed')
         }
-        lastTokenId = bsonToLong(body.lastTokenId)
-        lastChatId = bsonToLong(body.lastChatId)
+        // The packet decoder promotes a small int64 to a number, so the next
+        // page's position is read exactly in every form; a missing or repeated
+        // position would ask the same page again.
+        const token = readStateId(body.lastTokenId), last = readStateId(body.lastChatId)
+        const cursor = token === null || last === null ? null : `${token}:${last}`
+        if (cursor === null || cursor === lastCursor) {
+          throw new KakaoTalkError('LCHATLIST pagination incomplete: next page position unavailable', 'find_chat_in_list_failed')
+        }
+        lastCursor = cursor
+        lastTokenId = parseLong(token!)
+        lastChatId = parseLong(last!)
       }
       throw new KakaoTalkError(`LCHATLIST pagination incomplete after ${MAX_PAGES} pages`, 'find_chat_in_list_failed')
     } catch (error) {

@@ -1839,7 +1839,8 @@ export class KakaoTalkClient {
     try {
       let lastTokenId: Long | undefined
       let lastChatId: Long | undefined
-      let lastCursor: string | null = null
+      // The first request asks from position 0:0; a page naming it again repeats.
+      let lastCursor = '0:0'
       for (let pages = 0; pages < MAX_PAGES; pages++) {
         const response = await session!.getChatList(lastTokenId, lastChatId)
         check()

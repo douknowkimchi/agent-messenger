@@ -111,6 +111,7 @@ test('the next page position survives the decoder in number form and a stuck or 
     ['missing position', [packet({ chatDatas: [row(OTHER)], eof: false })], 1],
     ['negative position', [packet({ chatDatas: [row(OTHER)], eof: false, lastTokenId: -1, lastChatId: 9 })], 1],
     ['repeated position', [same, same], 2],
+    ['start position', [packet({ chatDatas: [row(OTHER)], eof: false, lastTokenId: 0, lastChatId: 0 })], 1],
   ] as const) {
     const f = fixture([...pages])
     try {

@@ -1817,6 +1817,68 @@ export class KakaoTalkClient {
     return result
   }
 
+  /**
+   * Find one chat in the present session's chat list (LCHATLIST from its
+   * start), without reconnecting or any other request kind than CHATINFO for
+   * the found chat's header (and INFOLINK for an untitled open chat). A room
+   * this account was member-invited into after login is refused by CHATINFO on
+   * the same session, while a new login lists it; this read lets a caller ask the list. Read-only. chatId must be a
+   * canonical positive uint64. Resolves null when this read of the list, to
+   * EOF, did not show the chat: that is no evidence the account is not in it.
+   * A refused header read leaves title null and team absent.
+   */
+  async findChatInListOnce(chatId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoChat | null> {
+    const cid = parseReadStateInput(chatId, 'chat'), wanted = longToString(cid), state = this.state, session = state?.session
+    const check = () => {
+      options.signal?.throwIfAborted()
+      if (!state || !session || this.closed || this.state !== state || this.state.session !== session) {
+        throw new KakaoTalkError('Chat list session unavailable or replaced', 'find_chat_in_list_failed')
+      }
+    }
+    check()
+    try {
+      let lastTokenId: Long | undefined
+      let lastChatId: Long | undefined
+      // The first request asks from position 0:0; a page naming it again repeats.
+      let lastCursor = '0:0'
+      for (let pages = 0; pages < MAX_PAGES; pages++) {
+        const response = await session!.getChatList(lastTokenId, lastChatId)
+        check()
+        assertLocoOk(response, 'LCHATLIST')
+        const body = response.body as unknown as ChatListResponse
+        if (!Array.isArray(body.chatDatas)) {
+          throw new KakaoTalkError('LCHATLIST chatDatas unavailable', 'find_chat_in_list_failed')
+        }
+        const chatDatas = body.chatDatas as ChatData[]
+        const chat = chatDatas.find((candidate) => longToString(candidate.c) === wanted)
+        if (chat) {
+          this.nameCache.ingest([chat])
+          const header = await this.fetchChatHeader(session!, cid, chat, check)
+          check()
+          return formatChat(chat, header.title, this.nameCache, header.team)
+        }
+        if (body.eof === true) return null
+        if (chatDatas.length === 0) {
+          throw new KakaoTalkError('LCHATLIST pagination incomplete: empty non-EOF page', 'find_chat_in_list_failed')
+        }
+        // The packet decoder promotes a small int64 to a number, so the next
+        // page's position is read exactly in every form; a missing or repeated
+        // position would ask the same page again.
+        const token = readStateId(body.lastTokenId), last = readStateId(body.lastChatId)
+        const cursor = token === null || last === null ? null : `${token}:${last}`
+        if (cursor === null || cursor === lastCursor) {
+          throw new KakaoTalkError('LCHATLIST pagination incomplete: next page position unavailable', 'find_chat_in_list_failed')
+        }
+        lastCursor = cursor
+        lastTokenId = parseLong(token!)
+        lastChatId = parseLong(last!)
+      }
+      throw new KakaoTalkError(`LCHATLIST pagination incomplete after ${MAX_PAGES} pages`, 'find_chat_in_list_failed')
+    } catch (error) {
+      throw wrapError(error, 'find_chat_in_list_failed', { classifyResponseFailure: true })
+    }
+  }
+
   async getChat(chatId: string): Promise<KakaoChat> {
     const parsedChatId = parseChatId(chatId)
     const normalizedChatId = longToString(parsedChatId)
@@ -1896,6 +1958,7 @@ export class KakaoTalkClient {
     session: LocoSession,
     chatId: Long,
     chat: ChatData | undefined,
+    check?: () => void,
   ): Promise<{ title: string | null; team: boolean | undefined }> {
     let title: string | null = null
     let team: boolean | undefined
@@ -1913,6 +1976,8 @@ export class KakaoTalkClient {
 
     const linkId = getOpenLinkId(chat)
     if (!linkId) return { title: null, team }
+    // A caller bound to one session stops here once it is replaced, closed or cancelled.
+    check?.()
 
     try {
       const response = await session.getOpenLinkInfo([linkId])

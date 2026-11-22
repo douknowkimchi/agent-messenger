@@ -1817,6 +1817,56 @@ export class KakaoTalkClient {
     return result
   }
 
+  /**
+   * Find one chat in the present session's chat list (LCHATLIST from its
+   * start), without reconnecting or any other request kind than CHATINFO for
+   * the found chat's header. A room this account was member-invited into after
+   * login is refused by CHATINFO on the same session, while a new login lists
+   * it; this read lets a caller ask the list. Read-only. chatId must be a
+   * canonical positive uint64. Resolves null when the whole list (to EOF) does
+   * not hold the chat; a refused header read leaves title null and team absent.
+   */
+  async findChatInListOnce(chatId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoChat | null> {
+    const cid = parseReadStateInput(chatId, 'chat'), wanted = longToString(cid), state = this.state, session = state?.session
+    const check = () => {
+      options.signal?.throwIfAborted()
+      if (!state || !session || this.closed || this.state !== state || this.state.session !== session) {
+        throw new KakaoTalkError('Chat list session unavailable or replaced', 'find_chat_in_list_failed')
+      }
+    }
+    check()
+    try {
+      let lastTokenId: Long | undefined
+      let lastChatId: Long | undefined
+      for (let pages = 0; pages < MAX_PAGES; pages++) {
+        const response = await session!.getChatList(lastTokenId, lastChatId)
+        check()
+        assertLocoOk(response, 'LCHATLIST')
+        const body = response.body as unknown as ChatListResponse
+        if (!Array.isArray(body.chatDatas)) {
+          throw new KakaoTalkError('LCHATLIST chatDatas unavailable', 'find_chat_in_list_failed')
+        }
+        const chatDatas = body.chatDatas as ChatData[]
+        const chat = chatDatas.find((candidate) => longToString(candidate.c) === wanted)
+        if (chat) {
+          this.nameCache.ingest([chat])
+          const header = await this.fetchChatHeader(session!, cid, chat)
+          check()
+          return formatChat(chat, header.title, this.nameCache, header.team)
+        }
+        if (body.eof === true) return null
+        if (chatDatas.length === 0) {
+          throw new KakaoTalkError('LCHATLIST pagination incomplete: empty non-EOF page', 'find_chat_in_list_failed')
+        }
+        lastTokenId = bsonToLong(body.lastTokenId)
+        lastChatId = bsonToLong(body.lastChatId)
+      }
+      throw new KakaoTalkError(`LCHATLIST pagination incomplete after ${MAX_PAGES} pages`, 'find_chat_in_list_failed')
+    } catch (error) {
+      throw wrapError(error, 'find_chat_in_list_failed', { classifyResponseFailure: true })
+    }
+  }
+
   async getChat(chatId: string): Promise<KakaoChat> {
     const parsedChatId = parseChatId(chatId)
     const normalizedChatId = longToString(parsedChatId)

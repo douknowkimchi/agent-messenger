@@ -1820,9 +1820,9 @@ export class KakaoTalkClient {
   /**
    * Find one chat in the present session's chat list (LCHATLIST from its
    * start), without reconnecting or any other request kind than CHATINFO for
-   * the found chat's header (and INFOLINK for an untitled open chat). A room this account was member-invited into after
-   * login is refused by CHATINFO on the same session, while a new login lists
-   * it; this read lets a caller ask the list. Read-only. chatId must be a
+   * the found chat's header (and INFOLINK for an untitled open chat). A room
+   * this account was member-invited into after login is refused by CHATINFO on
+   * the same session, while a new login lists it; this read lets a caller ask the list. Read-only. chatId must be a
    * canonical positive uint64. Resolves null when this read of the list, to
    * EOF, did not show the chat: that is no evidence the account is not in it.
    * A refused header read leaves title null and team absent.

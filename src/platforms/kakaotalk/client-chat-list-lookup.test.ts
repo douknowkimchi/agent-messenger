@@ -46,6 +46,7 @@ function fixture(pages: Array<LocoPacket | (() => LocoPacket)>, chatInfo: LocoPa
           assert.ok(next, 'no request past the scripted pages')
           return typeof next === 'function' ? next() : next
         }
+        if (method === 'INFOLINK') return packet({ ols: [{ li: Long.fromInt(300), ln: 'open-room' }] })
         assert.equal(method, 'CHATINFO', 'no login, JOIN, read mark or message request')
         assert.deepEqual(Object.keys(body), ['chatId'])
         return chatInfo
@@ -239,5 +240,33 @@ test('no dispatch without a present session, after cancellation or for an invali
     assert.equal(f.calls.length, 0)
     assert.equal(f.acquisitions(), 0)
     f.client.close()
+  }
+})
+
+test('an untitled open chat reads its link name, and a cancellation during CHATINFO sends no INFOLINK', async () => {
+  const open = (chatInfo: Record<string, unknown> = {}) =>
+    fixture([packet({ chatDatas: [row(ROOM, { t: 'OM', li: Long.fromInt(300) })], eof: true })],
+      packet({ chatInfo: { chatId: ROOM, type: 'OM', ...chatInfo } }))
+  const named = open()
+  try {
+    const chat = await named.client.findChatInListOnce(ROOM)
+    assert.equal(chat?.title, 'open-room')
+    assert.deepEqual(named.calls.map((call) => call.method), ['LCHATLIST', 'CHATINFO', 'INFOLINK'])
+  } finally {
+    named.client.close()
+  }
+  for (const fault of ['cancel', 'replace']) {
+    const f = open()
+    f.onSend((method) => {
+      if (method !== 'CHATINFO') return
+      if (fault === 'cancel') f.controller.abort()
+      else f.state.session = new LocoSession()
+    })
+    try {
+      await assert.rejects(f.client.findChatInListOnce(ROOM, { signal: f.controller.signal }))
+      assert.deepEqual(f.calls.map((call) => call.method), ['LCHATLIST', 'CHATINFO'], fault)
+    } finally {
+      f.client.close()
+    }
   }
 })

@@ -1820,7 +1820,7 @@ export class KakaoTalkClient {
   /**
    * Find one chat in the present session's chat list (LCHATLIST from its
    * start), without reconnecting or any other request kind than CHATINFO for
-   * the found chat's header. A room this account was member-invited into after
+   * the found chat's header (and INFOLINK for an untitled open chat). A room this account was member-invited into after
    * login is refused by CHATINFO on the same session, while a new login lists
    * it; this read lets a caller ask the list. Read-only. chatId must be a
    * canonical positive uint64. Resolves null when this read of the list, to
@@ -1853,7 +1853,7 @@ export class KakaoTalkClient {
         const chat = chatDatas.find((candidate) => longToString(candidate.c) === wanted)
         if (chat) {
           this.nameCache.ingest([chat])
-          const header = await this.fetchChatHeader(session!, cid, chat)
+          const header = await this.fetchChatHeader(session!, cid, chat, check)
           check()
           return formatChat(chat, header.title, this.nameCache, header.team)
         }
@@ -1958,6 +1958,7 @@ export class KakaoTalkClient {
     session: LocoSession,
     chatId: Long,
     chat: ChatData | undefined,
+    check?: () => void,
   ): Promise<{ title: string | null; team: boolean | undefined }> {
     let title: string | null = null
     let team: boolean | undefined
@@ -1975,6 +1976,8 @@ export class KakaoTalkClient {
 
     const linkId = getOpenLinkId(chat)
     if (!linkId) return { title: null, team }
+    // A caller bound to one session stops here once it is replaced, closed or cancelled.
+    check?.()
 
     try {
       const response = await session.getOpenLinkInfo([linkId])

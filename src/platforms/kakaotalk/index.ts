@@ -38,6 +38,7 @@ export type {
   KakaoMarkReadResult,
   KakaoSyncReadResult,
   KakaoMember,
+  KakaoConfirmedMemberNames,
   KakaoMemberSnapshot,
   KakaoMessage,
   KakaoMessagePage,

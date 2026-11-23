@@ -4343,6 +4343,73 @@ describe('KakaoTalkClient', () => {
       client.close()
     })
 
+    // 2026-11-23: a 13-member room whose GETMEM held 10 refused the strict
+    // snapshot, and every poll voter showed as unnamed. Names both rounds
+    // confirmed are given for display; the strict snapshot still fails.
+    describe('confirmed member names for display', () => {
+      const m = (id: number, nickName: unknown) => ({ userId: makeLong(id), nickName })
+      const answer = (members: Array<Record<string, unknown>>) => ({ statusCode: 0, body: { members, token: 0 } })
+
+      it('names members both rounds showed alike while the strict snapshot still fails', async () => {
+        const getmem = [m(42, 'Alice'), m(43, 'Bob'), m(44, '   '), m(45, 7)]
+        mockGetChannelInfo.mockResolvedValue(memberChannelInfo(6, [m(42, 'Alice'), m(46, 'Dana')]))
+        mockGetAllMembers.mockResolvedValue(answer(getmem))
+        const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
+        await expect(client.getMemberSnapshot('100')).rejects.toMatchObject({ code: 'get_member_snapshot_failed' })
+        mockGetChannelInfo.mockClear()
+        mockGetAllMembers.mockClear()
+
+        const value = await client.getConfirmedMemberNamesOnce('100')
+        expect(value).toEqual({
+          chat_id: '100',
+          names: [{ user_id: '42', nickname: 'Alice' }, { user_id: '43', nickname: 'Bob' }, { user_id: '46', nickname: 'Dana' }],
+        })
+        expect(mockGetChannelInfo).toHaveBeenCalledTimes(2)
+        expect(mockGetAllMembers).toHaveBeenCalledTimes(2)
+        expect(mockEnterRoom).not.toHaveBeenCalled()
+        expect(mockGetChatInfo).not.toHaveBeenCalled()
+        expect(mockMarkRead).not.toHaveBeenCalled()
+        client.close()
+      })
+
+      it('drops a member swapped out, renamed or named two ways, and keeps the rest', async () => {
+        mockGetChannelInfo
+          .mockResolvedValueOnce(memberChannelInfo(4, [m(45, 'Eve')]))
+          .mockResolvedValueOnce(memberChannelInfo(4, [m(45, 'Eve')]))
+        mockGetAllMembers
+          .mockResolvedValueOnce(answer([m(42, 'Alice'), m(43, 'Bob'), m(44, 'Carol'), m(45, 'Evelyn')]))
+          .mockResolvedValueOnce(answer([m(42, 'Alice'), m(43, 'Bobby'), m(47, 'Frank'), m(45, 'Evelyn')]))
+        const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
+        await client.acquireSession()
+        const value = await client.getConfirmedMemberNamesOnce('100')
+        expect(value.names).toEqual([{ user_id: '42', nickname: 'Alice' }])
+        client.close()
+      })
+
+      it('confirms none when the member count changed or a round names more members than the room', async () => {
+        mockGetChannelInfo
+          .mockResolvedValueOnce(memberChannelInfo(3)).mockResolvedValueOnce(memberChannelInfo(4))
+          .mockResolvedValueOnce(memberChannelInfo(1)).mockResolvedValueOnce(memberChannelInfo(1))
+        mockGetAllMembers.mockResolvedValue(answer([m(42, 'Alice'), m(43, 'Bob')]))
+        const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
+        await client.acquireSession()
+        expect((await client.getConfirmedMemberNamesOnce('100')).names).toEqual([])
+        expect((await client.getConfirmedMemberNamesOnce('100')).names).toEqual([])
+        client.close()
+      })
+
+      it('refuses another room\'s CHATINFO and never enters the room', async () => {
+        mockGetChannelInfo.mockResolvedValue(memberChannelInfo(2, [m(42, 'Alice')], 101))
+        mockGetAllMembers.mockResolvedValue(answer([m(42, 'Alice')]))
+        const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
+        await client.acquireSession()
+        await expect(client.getConfirmedMemberNamesOnce('100')).rejects.toMatchObject({ code: 'get_member_names_failed' })
+        expect(mockGetAllMembers).not.toHaveBeenCalled()
+        expect(mockEnterRoom).not.toHaveBeenCalled()
+        client.close()
+      })
+    })
+
     it('returns a stable empty snapshot for a zero-member room without CHATONROOM', async () => {
       mockGetChannelInfo.mockResolvedValue(memberChannelInfo(0))
       mockGetAllMembers.mockResolvedValue({

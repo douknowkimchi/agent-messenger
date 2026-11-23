@@ -763,7 +763,7 @@ test('read-only recent opening validates input and cancellation before dispatch'
     assert.equal(f.calls.length, 0)
   } finally { f.client.close() }
 })
-for (const method of ['getChatOnce','getMemberSnapshotOnce'] as const) {
+for (const method of ['getChatOnce','getMemberSnapshotOnce','getConfirmedMemberNamesOnce'] as const) {
   test(`${method} keeps the existing parser on the present session`, async () => {
     const f = openIdentityFixture(0,'','OM')
     try { await f.client[method](ROOM); assert.equal(f.calls.length, method === 'getChatOnce' ? 2 : 4); assert.equal(f.acquisitions(),0) }

@@ -162,6 +162,17 @@ export interface KakaoMember {
   open_permission: number | null
 }
 
+/**
+ * Display-only names of one room's members: only members that both of a
+ * same-session double read (CHATINFO and GETMEM, twice) showed under the same
+ * exact user ID with the same non-empty name. It is never a complete member
+ * list, membership proof, recipient set or send authority.
+ */
+export interface KakaoConfirmedMemberNames {
+  chat_id: string
+  names: Array<{ user_id: string; nickname: string }>
+}
+
 export interface KakaoMemberSnapshot {
   chat_id: string
   active_members: number

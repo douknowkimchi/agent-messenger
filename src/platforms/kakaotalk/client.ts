@@ -46,6 +46,7 @@ import {
   type KakaoMarkReadResult,
   type KakaoSyncReadResult,
   type KakaoMember,
+  type KakaoConfirmedMemberNames,
   type KakaoMemberSnapshot,
   type KakaoMessage,
   type KakaoMessagePage,
@@ -1199,6 +1200,45 @@ function subsetIds(subset: Set<string>, superset: Set<string>): boolean {
   return [...subset].every((id) => superset.has(id))
 }
 
+type MemberView = { records: Array<Record<string, unknown>>; ids: Set<string> }
+type ChannelMemberView = MemberView & { activeMembers: number }
+type MemberRounds = {
+  firstChat: ChannelMemberView
+  firstMembers: MemberView
+  secondChat: ChannelMemberView
+  secondMembers: MemberView
+}
+
+// One round's names by exact user ID from its CHATINFO display members and
+// GETMEM records. A member both answers name differently, or without a
+// non-empty string name, has none in this round.
+function roundMemberNames(chat: MemberView, members: MemberView): Map<string, string | null> {
+  const names = new Map<string, string | null>()
+  for (const record of [...members.records, ...chat.records]) {
+    const id = memberIdKey(record)
+    if (!id) continue
+    const name = typeof record.nickName === 'string' && record.nickName.trim() !== '' ? record.nickName : null
+    names.set(id, names.has(id) && names.get(id) !== name ? null : name)
+  }
+  return names
+}
+
+// Names both rounds confirmed: the same exact ID with the same name in each.
+// A changed member count, or a round naming more members than the room
+// holds, confirms none.
+function confirmedMemberNames(rounds: MemberRounds): Array<{ user_id: string; nickname: string }> {
+  const { firstChat, firstMembers, secondChat, secondMembers } = rounds
+  if (firstChat.activeMembers !== secondChat.activeMembers) return []
+  const first = roundMemberNames(firstChat, firstMembers)
+  const second = roundMemberNames(secondChat, secondMembers)
+  if (first.size > firstChat.activeMembers || second.size > secondChat.activeMembers) return []
+  const confirmed: Array<{ user_id: string; nickname: string }> = []
+  for (const [id, name] of second) {
+    if (name !== null && first.get(id) === name) confirmed.push({ user_id: id, nickname: name })
+  }
+  return confirmed
+}
+
 function channelMemberView(
   body: Record<string, unknown>,
   expectedChatId: string,
@@ -2240,25 +2280,62 @@ export class KakaoTalkClient {
     return this.executeWithReconnect(({ session }) => this.getMemberSnapshotOnSession(session, parsedChatId, normalizedChatId))
   }
 
-  private async getMemberSnapshotOnSession(session: LocoSession, parsedChatId: Long, normalizedChatId: string, check?: () => void): Promise<KakaoMemberSnapshot> {
-    check?.()
+  /**
+   * Display-only member names of one room on the current session only: no
+   * acquire, reconnect, login, retry or CHATONROOM; the same four reads as the
+   * strict snapshot (CHATINFO, GETMEM, CHATINFO, GETMEM). Only members both
+   * rounds showed under the same exact user ID with the same non-empty name
+   * are returned, and none when the room's member count changed between the
+   * rounds or a round holds more members than the room. An incomplete roster
+   * still yields the names it confirmed; it never becomes a complete list.
+   */
+  async getConfirmedMemberNamesOnce(chatId: string, options: { signal?: AbortSignal } = {}): Promise<KakaoConfirmedMemberNames> {
+    const cid = parseChatId(chatId), normalizedChatId = longToString(cid), state = this.state, session = state?.session
+    const check = () => {
+      options.signal?.throwIfAborted()
+      if (!state || !session || this.closed || this.state !== state || this.state.session !== session) {
+        throw new KakaoTalkError('member_names_session_unavailable_or_replaced', 'get_member_names_failed')
+      }
+    }
     try {
-      const firstChatResponse = await session.getChannelInfo(parsedChatId)
-      check?.()
-      assertLocoOk(firstChatResponse, 'CHATINFO')
-      const firstChat = channelMemberView(firstChatResponse.body as Record<string, unknown>, normalizedChatId)
-      const firstMemberResponse = await session.getAllMembers(parsedChatId)
-      check?.()
-      assertLocoOk(firstMemberResponse, 'GETMEM')
-      const firstMembers = exactMemberRecords(firstMemberResponse.body.members ?? [], 'GETMEM')
-      const secondChatResponse = await session.getChannelInfo(parsedChatId)
-      check?.()
-      assertLocoOk(secondChatResponse, 'CHATINFO')
-      const secondChat = channelMemberView(secondChatResponse.body as Record<string, unknown>, normalizedChatId)
-      const secondMemberResponse = await session.getAllMembers(parsedChatId)
-      check?.()
-      assertLocoOk(secondMemberResponse, 'GETMEM')
-      const secondMembers = exactMemberRecords(secondMemberResponse.body.members ?? [], 'GETMEM')
+      check()
+      const rounds = await this.readMemberRounds(session!, cid, normalizedChatId, check)
+      check()
+      return { chat_id: normalizedChatId, names: confirmedMemberNames(rounds) }
+    } catch (error) {
+      throw wrapError(error, 'get_member_names_failed')
+    }
+  }
+
+  // CHATINFO, GETMEM, CHATINFO, GETMEM on one session, each answer checked
+  // for its status and exact record shape; `check` runs after every answer.
+  private async readMemberRounds(
+    session: LocoSession, parsedChatId: Long, normalizedChatId: string, check?: () => void,
+  ): Promise<MemberRounds> {
+    check?.()
+    const firstChatResponse = await session.getChannelInfo(parsedChatId)
+    check?.()
+    assertLocoOk(firstChatResponse, 'CHATINFO')
+    const firstChat = channelMemberView(firstChatResponse.body as Record<string, unknown>, normalizedChatId)
+    const firstMemberResponse = await session.getAllMembers(parsedChatId)
+    check?.()
+    assertLocoOk(firstMemberResponse, 'GETMEM')
+    const firstMembers = exactMemberRecords(firstMemberResponse.body.members ?? [], 'GETMEM')
+    const secondChatResponse = await session.getChannelInfo(parsedChatId)
+    check?.()
+    assertLocoOk(secondChatResponse, 'CHATINFO')
+    const secondChat = channelMemberView(secondChatResponse.body as Record<string, unknown>, normalizedChatId)
+    const secondMemberResponse = await session.getAllMembers(parsedChatId)
+    check?.()
+    assertLocoOk(secondMemberResponse, 'GETMEM')
+    const secondMembers = exactMemberRecords(secondMemberResponse.body.members ?? [], 'GETMEM')
+    return { firstChat, firstMembers, secondChat, secondMembers }
+  }
+
+  private async getMemberSnapshotOnSession(session: LocoSession, parsedChatId: Long, normalizedChatId: string, check?: () => void): Promise<KakaoMemberSnapshot> {
+    try {
+      const { firstChat, firstMembers, secondChat, secondMembers } =
+        await this.readMemberRounds(session, parsedChatId, normalizedChatId, check)
       if (
         firstChat.activeMembers !== secondChat.activeMembers ||
         firstMembers.records.length !== firstChat.activeMembers ||

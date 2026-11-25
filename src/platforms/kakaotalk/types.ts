@@ -105,7 +105,8 @@ export interface KakaoChat {
   display_member_ids: string[] | null
   title: string | null
   active_members: number
-  unread_count: number
+  /** Null when Kakao marked the count invalid (CHATINFO invalidNewMessageCount): unknown, never 0. */
+  unread_count: number | null
   /** The open chat's own link id (room li), canonical positive int64; null for normal chats or when absent. Never a member's profile link. */
   link_id?: string | null
   /**
@@ -458,7 +459,7 @@ export const KakaoChatSchema = z.object({
   display_member_ids: z.array(z.string()).nullable().optional(),
   title: z.string().nullable(),
   active_members: z.number(),
-  unread_count: z.number(),
+  unread_count: z.number().nullable(),
   link_id: z.string().nullable().optional(),
   last_message: z
     .object({

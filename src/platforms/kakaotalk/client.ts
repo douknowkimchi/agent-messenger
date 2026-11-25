@@ -524,7 +524,7 @@ function formatChat(chat: ChatData, title: string | null, nameCache: MemberNameC
     display_member_ids: displayMemberIds(chat.i),
     title,
     active_members: chat.a as number,
-    unread_count: chat.n as number,
+    unread_count: chat.n === null ? null : (chat.n as number),
     last_message: lastLog
       ? {
           author_id: lastLog.authorId as number,
@@ -646,8 +646,9 @@ function channelInfoToChatData(body: Record<string, unknown>, expectedChatId: st
   const info = extractChannelInfo(body, expectedChatId)
   const type = requiredChatType(info.type)
   const activeMembers = requiredNonNegativeInteger(info.activeMembersCount, 'activeMembersCount')
+  // A count Kakao marks invalid is unknown: never report it as 0 unread.
   const unreadCount =
-    info.invalidNewMessageCount === true ? 0 : requiredNonNegativeInteger(info.newMessageCount, 'newMessageCount')
+    info.invalidNewMessageCount === true ? null : requiredNonNegativeInteger(info.newMessageCount, 'newMessageCount')
   const displayMembers = Array.isArray(info.displayMembers) ? info.displayMembers : []
   const memberIds: unknown[] = []
   const memberNames: string[] = []

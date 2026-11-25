@@ -1307,6 +1307,38 @@ describe('KakaoTalkClient', () => {
       client.close()
     })
 
+    it('answers null for a count Kakao marked invalid and the exact count otherwise, a real zero included', async () => {
+      const chatInfo = (newMessageCount: number, invalidNewMessageCount: boolean) => ({
+        statusCode: 0,
+        body: {
+          chatInfo: {
+            chatId: makeLong(320),
+            type: 1,
+            left: false,
+            activeMembersCount: 3,
+            newMessageCount,
+            invalidNewMessageCount,
+            lastLogId: makeLong(9),
+            lastSeenLogId: makeLong(2),
+            lastChatLog: null,
+            displayMembers: [{ userId: makeLong(43), nickName: 'Bob' }],
+            chatMetas: [{ type: 3, content: 'Count room' }],
+          },
+        },
+      })
+      mockGetChannelInfo
+        .mockResolvedValueOnce(chatInfo(7, false))
+        .mockResolvedValueOnce(chatInfo(7, true))
+        .mockResolvedValueOnce(chatInfo(3, false))
+        .mockResolvedValueOnce(chatInfo(0, false))
+
+      const client = await new KakaoTalkClient().login({ oauthToken: 'token', userId: 'user1', deviceUuid: 'device1' })
+      const counts = []
+      for (let index = 0; index < 4; index++) counts.push((await client.getChat('320')).unread_count)
+      expect(counts).toEqual([7, null, 3, 0])
+      client.close()
+    })
+
     it('returns one fully normalized late chat from read-only CHATINFO', async () => {
       mockGetChannelInfo.mockResolvedValueOnce({
         statusCode: 0,
